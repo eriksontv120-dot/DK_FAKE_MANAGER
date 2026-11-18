@@ -1,44 +1,49 @@
 /*
- * DK4 – Správca FAKE útokov (Divoké kmene)
- * Verzia: 1.2.0 (2026-11-18) – verzia na schválenie
+ * DK4 – Fake Attack Manager (Tribal Wars / Divoké kmene)
+ * Version: 1.3.0 (2026-11-18) – Script Library submission
+ * Languages: English (default), Slovak – switchable in the panel header (EN | SK).
  *
- * Čo script robí:
- *   - z vložených súradníc naplánuje FAKE útoky (OFF s baranidlom / DEFF kopijníci+mečiari),
- *   - veľkosť fejku počíta podľa fake limitu sveta (body vysielajúcej dediny × fake_limit %),
- *   - vypočíta čas odoslania tak, aby útok dopadol v zadanom okne a mimo nočného bonusu,
- *   - spravuje frontu útokov s progress barom.
+ * What the script does:
+ *   - Plans FAKE attacks from a pasted list of target coordinates
+ *     (OFF villages: ram + scouts/light cavalry/axemen; DEFF villages: spear fighters/swordsmen).
+ *   - Fake size follows the world fake limit (sending village points × fake_limit %).
+ *   - Calculates send times so every attack lands inside the chosen time window and outside the night bonus.
+ *   - Manages a queue of attacks with a progress bar.
  *
- * Odosielanie:
- *   - Nádvorie vysielajúcej dediny sa otvorí v paneli predvyplnené cez URL parametre (x, y, jednotky) –
- *     rovnaký princíp ako schválený Mass Command Timer.
- *   - Na "Útok" a "Poslať útok" kliká hráč sám. Script na nádvorí ani na potvrdzovacej stránke
- *     nemení tlačidlá, neposúva na ne kurzor, nič do stránky nevkladá a formulár neodosiela.
- *   - Kontroly (jednotky, cieľ, čas dopadu, čas pochodu) script iba ZOBRAZÍ v paneli mimo stránky hry.
- *   - Ďalší útok (nádvorie ďalšej dediny z fronty) sa načíta až po kliknutí hráča na "ĎALŠÍ ÚTOK".
- *     Pri tomto kliknutí script prečíta tabuľku "Vlastné príkazy" v ráme (bez požiadavky na server)
- *     a predchádzajúci útok označí ako odoslaný. Jedno kliknutie = jedna akcia; script na nič nereaguje sám.
- *   - Mapa sveta (/map/village.txt) sa sťahuje najviac raz za hodinu, inak sa číta z IndexedDB.
+ * Sending:
+ *   - The rally point of the sending village is loaded in a frame inside the panel, pre-filled
+ *     via URL parameters (x, y, units) – the same principle as the previously approved Mass Command Timer.
+ *   - The player clicks "Attack" and "Send attack" himself. The script does not change, focus, click
+ *     or disable any game button, does not insert anything into the rally point / confirmation page
+ *     and never submits a form.
+ *   - Checks (units, target, landing time, travel time) are only DISPLAYED in the panel, outside the game page.
+ *   - The next attack (rally point of the next village from the queue) is loaded only when the player clicks
+ *     "NEXT ATTACK". On that click the script reads the "Own commands" table already shown in the frame
+ *     (no server request) and marks the previous attack as sent. One click = one action; the script
+ *     never reacts to account events on its own.
  *
- * Ďalšie:
- *   - Žiadne požiadavky na stránky tretích strán. Číta len herné stránky a verejné súbory sveta:
+ * Other:
+ *   - No requests to third-party sites. Only game pages and public world files are read:
  *     /interface.php?func=get_config, /interface.php?func=get_unit_info, /map/village.txt,
  *     overview_villages (prod, combined, commands), info_player, screen=place.
- *   - Kód nie je obfuskovaný; všetky nastavenia sú v rozhraní (žiadne úpravy kódu).
- *   - Uložené dáta: len localStorage v prehliadači hráča.
+ *   - World data (/map/village.txt) is downloaded at most once per hour (cached in IndexedDB).
+ *   - World config is cached for 6 hours.
+ *   - No obfuscation; all settings are in the interface (no code editing). No cookies –
+ *     data is stored only in the player's browser (localStorage / IndexedDB).
  */
 (async function () {
     'use strict';
 
     const $ = window.jQuery;
     if (!$ || !window.game_data || !$('#content_value').length) {
-        alert('Spusti script v hre Divoké kmene (na ľubovoľnej hernej stránke).');
+        alert('Run this script inside Tribal Wars (on any game page).\nSpusti script v hre Divoké kmene (na ľubovoľnej hernej stránke).');
         return;
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Konštanty                                                          */
+    /*  Constants                                                          */
     /* ------------------------------------------------------------------ */
-    const VERSION = '1.2.0';
+    const VERSION = '1.3.0';
     const WORLD = game_data.world;
     const PID = String(game_data.player.id);
     const KEY = `dk4fm_${WORLD}_${PID}`;
@@ -50,60 +55,76 @@
     const GAME_UNITS = (game_data.units || []).slice();
     const IS_MOBILE = $('#mobileHeader').length > 0 || !!window.mobile;
 
-    const UNIT_NAME = {
-        spear: 'Kopijník', sword: 'Mečiar', axe: 'Sekerník', archer: 'Lukostrelec',
-        spy: 'Špeh', light: 'Ľahká jazda', marcher: 'Lukostrelec na koni', heavy: 'Ťažká jazda',
-        ram: 'Baranidlo', catapult: 'Katapult', knight: 'Paladin', snob: 'Šľachtic', militia: 'Domobrana',
+    /* ------------------------------------------------------------------ */
+    /*  Language (EN default / SK)                                         */
+    /* ------------------------------------------------------------------ */
+    let LANG = 'en';
+    const L = (en, sk) => (LANG === 'sk' ? sk : en);
+    const UNIT_NAMES = {
+        en: {
+            spear: 'Spear fighter', sword: 'Swordsman', axe: 'Axeman', archer: 'Archer',
+            spy: 'Scout', light: 'Light cavalry', marcher: 'Mounted archer', heavy: 'Heavy cavalry',
+            ram: 'Ram', catapult: 'Catapult', knight: 'Paladin', snob: 'Nobleman', militia: 'Militia',
+        },
+        sk: {
+            spear: 'Kopijník', sword: 'Mečiar', axe: 'Sekerník', archer: 'Lukostrelec',
+            spy: 'Špeh', light: 'Ľahká jazda', marcher: 'Lukostrelec na koni', heavy: 'Ťažká jazda',
+            ram: 'Baranidlo', catapult: 'Katapult', knight: 'Paladin', snob: 'Šľachtic', militia: 'Domobrana',
+        },
     };
-    // Jednotky, ktoré script smie VôBEC použiť (žiadna ťažká jazda, katapulty, šľachtici, paladin).
+    const uName = (u) => UNIT_NAMES[LANG][u] || u;
+
+    // Units the script is allowed to use at all (no heavy cavalry, catapults, noblemen or paladin).
     const OFF_FILLERS = ['spy', 'light', 'axe'];
     const DEFF_FILLERS = ['spear', 'sword'];
     const ALLOWED_UNITS = new Set(['ram', ...OFF_FILLERS, ...DEFF_FILLERS]);
-    // Na klasifikáciu dediny (OFF / DEFF) podľa populácie jednotiek.
+    // Village classification (OFF / DEFF) by unit population.
     const OFF_CLASS = ['axe', 'light', 'marcher', 'ram', 'catapult'];
     const DEFF_CLASS = ['spear', 'sword', 'archer', 'heavy'];
     const SHOWN_UNITS = ['spear', 'sword', 'axe', 'spy', 'light', 'heavy', 'ram'].filter((u) => GAME_UNITS.includes(u));
 
     const STATUS = {
-        pending: { t: 'Čaká na kontrolu', c: '#7a6a3a' },
-        ready: { t: 'Pripravený', c: '#2e7d32' },
-        progress: { t: 'Prebieha odoslanie', c: '#1565c0' },
-        unverified: { t: 'Neoverené', c: '#b26a00' },
-        error: { t: 'Chyba', c: '#c62828' },
-        sent: { t: 'Odoslaný', c: '#1b5e20' },
-        removed: { t: 'Odstránený', c: '#757575' },
+        pending: { en: 'Waiting', sk: 'Čaká na kontrolu', c: '#7a6a3a' },
+        ready: { en: 'Ready', sk: 'Pripravený', c: '#2e7d32' },
+        progress: { en: 'Open in rally point', sk: 'Otvorený v nádvorí', c: '#1565c0' },
+        unverified: { en: 'Unverified', sk: 'Neoverené', c: '#b26a00' },
+        error: { en: 'Error', sk: 'Chyba', c: '#c62828' },
+        sent: { en: 'Sent', sk: 'Odoslaný', c: '#1b5e20' },
+        removed: { en: 'Removed', sk: 'Odstránený', c: '#757575' },
     };
+    const stLabel = (k) => L(STATUS[k].en, STATUS[k].sk);
     const ACTIVE = new Set(['pending', 'ready', 'progress', 'unverified', 'error']);
     const RESERVING = new Set(['pending', 'ready', 'progress', 'unverified', 'error']);
 
     /* ------------------------------------------------------------------ */
-    /*  Pomocné funkcie                                                    */
+    /*  Helpers                                                            */
     /* ------------------------------------------------------------------ */
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const num = (s) => parseInt(String(s ?? '').replace(/[^\d]/g, ''), 10) || 0;
     const pad = (n, l = 2) => String(n).padStart(l, '0');
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const uid = () => Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
-    const fmtNum = (n) => Math.round(n || 0).toLocaleString('sk-SK');
+    const fmtNum = (n) => Math.round(n || 0).toLocaleString(LANG === 'sk' ? 'sk-SK' : 'en-GB');
     const coordRe = (c) => {
         const [x, y] = c.split('|');
         return new RegExp(`(^|\\D)${x}\\|${y}(\\D|$)`);
     };
     const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
     const unitList = (units) => Object.keys(units).filter((u) => units[u] > 0);
-    const unitsText = (units) => unitList(units).map((u) => `${UNIT_NAME[u] || u} ${units[u]}`).join(', ');
+    const unitsText = (units) => unitList(units).map((u) => `${uName(u)} ${units[u]}`).join(', ');
     const variantName = (units) => {
         const order = ['spear', 'sword', 'spy', 'light', 'axe', 'ram'];
-        return order.filter((u) => units[u] > 0).map((u) => (UNIT_NAME[u] || u).toLowerCase()).join(' + ').replace(/^./, (c) => c.toUpperCase());
+        return order.filter((u) => units[u] > 0).map((u) => uName(u).toLowerCase()).join(' + ').replace(/^./, (c) => c.toUpperCase());
     };
     const unitIcon = (u) =>
         window.image_base
-            ? `<img src="${window.image_base}unit/unit_${u}.webp" title="${esc(UNIT_NAME[u] || u)}" style="width:16px;height:16px;vertical-align:middle">`
-            : `<b title="${esc(UNIT_NAME[u] || u)}">${esc((UNIT_NAME[u] || u).slice(0, 3))}</b>`;
+            ? `<img src="${window.image_base}unit/unit_${u}.webp" title="${esc(uName(u))}" style="width:16px;height:16px;vertical-align:middle">`
+            : `<b title="${esc(uName(u))}">${esc(uName(u).slice(0, 3))}</b>`;
     const unitsHtml = (units) => unitList(units).map((u) => `<span class="dk-u">${unitIcon(u)}&nbsp;${units[u]}</span>`).join(' ');
+    const popWord = () => L('pop.', 'obyv.');
 
-    // Čas: všetky časy v scripte sú "nástenné hodiny sveta" uložené ako UTC milisekundy.
-    // (Dátum/čas, ktorý ukazuje hra, sa interpretuje ako UTC => žiadne problémy s pásmom PC.)
+    // Time: all times are world "wall clock" values stored as UTC milliseconds
+    // (the date/time shown by the game is treated as UTC => no problems with the PC time zone).
     function readServerWall() {
         const d = $('#serverDate').text().trim().split('/');
         const t = $('#serverTime').text().trim().split(':');
@@ -111,17 +132,14 @@
         return Date.UTC(+d[2], +d[1] - 1, +d[0], +t[0], +t[1], +t[2]);
     }
     const realNow = () => (window.Timing && typeof Timing.getCurrentServerTime === 'function' ? Timing.getCurrentServerTime() : Date.now());
-    let TZ_MS = 0; // posun času sveta oproti UTC
-    let CLOCK_FALLBACK = 0;
+    let TZ_MS = 0; // world time offset from UTC
     (function initClock() {
         const wall = readServerWall();
         if (wall === null) {
             TZ_MS = -new Date().getTimezoneOffset() * 60000;
             return;
         }
-        TZ_MS = Math.round((wall - realNow()) / 900000) * 900000; // zaokrúhlenie na 15 min
-        CLOCK_FALLBACK = wall - (realNow() + TZ_MS);
-        if (Math.abs(CLOCK_FALLBACK) > 5000) CLOCK_FALLBACK = 0;
+        TZ_MS = Math.round((wall - realNow()) / 900000) * 900000; // rounded to 15 min
     })();
     const now = () => realNow() + TZ_MS;
     const tzLabel = () => {
@@ -169,7 +187,7 @@
         return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
     };
 
-    // Sieť: GET s opakovaním a odstupom (hra povoľuje max. ~5 požiadaviek/s).
+    // Network: GET with retry and spacing (the game allows ~5 requests per second).
     let lastReq = 0;
     async function httpGet(url, dataType) {
         let lastErr;
@@ -184,16 +202,17 @@
                 await sleep(800 * (i + 1));
             }
         }
-        throw new Error(`Sieťová chyba pri načítaní ${url.split('?')[0]} (${lastErr && lastErr.status})`);
+        throw new Error(L(`Network error while loading ${url.split('?')[0]} (${lastErr && lastErr.status})`, `Sieťová chyba pri načítaní ${url.split('?')[0]} (${lastErr && lastErr.status})`));
     }
     const gameUrl = (screen, extra = '') => `/game.php?${SITTER}village=${CUR_VID}&screen=${screen}${extra}`;
 
     /* ------------------------------------------------------------------ */
-    /*  Stav (uložený v localStorage – prežije obnovenie stránky)          */
+    /*  State (localStorage – survives page reload)                        */
     /* ------------------------------------------------------------------ */
     const DEFAULT_SETTINGS = () => ({
+        lang: 'en',
         coords: '',
-        autoDate: true, // dátum dopadu sa určí sám podľa času pochodu
+        autoDate: true, // landing date is chosen automatically from the travel time
         autoDays: 14,
         date: isoDate(now() + DAY),
         from: '08:00:01',
@@ -212,35 +231,31 @@
         reserve: {},
         override: {}, // villageId -> auto | off | deff | skip
     });
-    let state = { mode: 'live', settings: DEFAULT_SETTINGS(), queue: [], seq: 0 };
+    let state = { settings: DEFAULT_SETTINGS(), queue: [], seq: 0 };
     try {
         const saved = JSON.parse(localStorage.getItem(KEY) || 'null');
         if (saved && Array.isArray(saved.queue)) {
             state = { ...state, ...saved, settings: { ...DEFAULT_SETTINGS(), ...(saved.settings || {}) } };
         }
     } catch (e) {
-        console.warn('DK4: uložený stav sa nepodarilo načítať', e);
+        console.warn('DK4: saved state could not be loaded', e);
     }
-    // Útoky, ktoré boli pri obnovení stránky "v procese", sa musia overiť.
-    state.mode = 'live';
+    const S = () => state.settings;
+    LANG = S().lang === 'sk' ? 'sk' : 'en';
+    // Attacks that were "open" when the page was reloaded must be verified.
     state.queue.forEach((q) => {
-        if (q.test && ACTIVE.has(q.status) && q.status !== 'progress') {
-            q.status = 'removed';
-            q.reason = 'Testovací režim bol zrušený';
-        }
         if (q.status === 'progress') {
             q.status = 'unverified';
-            q.reason = 'Stránka bola obnovená počas odosielania – over v prehľade príkazov.';
+            q.reason = L('The page was reloaded while sending – verify in the commands overview.', 'Stránka bola obnovená počas odosielania – over v prehľade príkazov.');
         }
     });
     function save() {
         try {
             localStorage.setItem(KEY, JSON.stringify(state));
         } catch (e) {
-            console.error('DK4: uloženie zlyhalo', e);
+            console.error('DK4: saving failed', e);
         }
     }
-    const S = () => state.settings;
     const log = (item, msg) => {
         item.log = item.log || [];
         item.log.push(`${fmtShort(now())} ${msg}`);
@@ -248,9 +263,9 @@
     };
 
     /* ------------------------------------------------------------------ */
-    /*  Nastavenia sveta (skutočné hodnoty zo servera)                     */
+    /*  World settings (real values from the server)                       */
     /* ------------------------------------------------------------------ */
-    let cfg = null; // { fakeLimit, night:{active,start,end}, units:{u:{speed,pop}}, speed, unitSpeed }
+    let cfg = null; // { fakeLimit, night:{active,start,end}, units:{u:{speed,pop}} }
 
     async function loadWorldConfig(force) {
         try {
@@ -273,7 +288,7 @@
             const pop = parseFloat($(this).find('pop').text());
             if (isFinite(speed) && isFinite(pop)) u[name] = { speed, pop };
         });
-        if (!Object.keys(u).length) throw new Error('Nepodarilo sa načítať jednotky sveta (get_unit_info).');
+        if (!Object.keys(u).length) throw new Error(L('Could not load world units (get_unit_info).', 'Nepodarilo sa načítať jednotky sveta (get_unit_info).'));
         const fl = txt('game > fake_limit');
         cfg = {
             at: Date.now(),
@@ -283,11 +298,9 @@
                 start: num(txt('night > start_hour')),
                 end: num(txt('night > end_hour')),
             },
-            speed: parseFloat(txt('config > speed')) || null,
-            unitSpeed: parseFloat(txt('config > unit_speed')) || null,
             units: u,
         };
-        if (cfg.fakeLimit === null) throw new Error('V nastaveniach sveta chýba fake_limit – nastav ho ručne v "Pokročilé".');
+        if (cfg.fakeLimit === null) throw new Error(L('fake_limit is missing in the world settings – set it manually in "Advanced".', 'V nastaveniach sveta chýba fake_limit – nastav ho ručne v "Pokročilé".'));
         localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
     }
     const fakeLimit = () => {
@@ -296,28 +309,33 @@
     };
     const pop = (u) => cfg.units[u].pop;
     const speed = (u) => cfg.units[u].speed;
-    // Body z mapy sveta môžu byť až 1 h staré → bezpečnostná rezerva +1 % (aspoň +1 obyv.).
+    // Points taken from the world map can be up to 1 h old → safety margin +1 % (at least +1 pop.).
     const MAP_SAFETY_PCT = 1;
-    const fromMap = (v) => /mapa/.test(v.pointsSrc || '');
+    const fromMap = (v) => v.pointsSrc === 'map';
+    const srcLabel = (v) => ({
+        prod: L('production overview', 'prehľad produkcie'),
+        profile: L('player profile', 'profil hráča'),
+        map: L('world map (up to 1 h old)', 'mapa sveta (môže byť až 1 h stará)'),
+    }[v.pointsSrc] || '');
     const minPopFor = (v) => {
         const base = Math.max(1, Math.ceil((v.points * fakeLimit()) / 100));
         return fromMap(v) ? base + Math.max(1, Math.ceil((base * MAP_SAFETY_PCT) / 100)) : base;
     };
 
     /* ------------------------------------------------------------------ */
-    /*  Načítanie vlastných dedín (body + jednotky doma)                   */
+    /*  Own villages (points + units at home)                              */
     /* ------------------------------------------------------------------ */
-    let villages = []; // {id, name, coord, x, y, points, troops:{}}
+    let villages = []; // {id, name, coord, x, y, points, pointsSrc, troops:{}}
     let snapshotAt = 0;
 
     async function loadVillages() {
         const prodHtml = await httpGet(gameUrl('overview_villages', `&mode=prod&group=${GROUP}&page=-1`));
         const doc = $($.parseHTML(prodHtml));
         const list = [];
-        // index stĺpca "Body" podľa hlavičky (fallback = 3. stĺpec, ako vo funkčnom vyrovnávači skladov)
+        // index of the "Points" column from the header (fallback = 3rd column)
         let pIdx = -1;
         doc.find('#production_table tr').first().children('th').each(function (i) {
-            if (pIdx < 0 && /bod|points/i.test($(this).text())) pIdx = i;
+            if (pIdx < 0 && /bod|points|punkt/i.test($(this).text())) pIdx = i;
         });
         doc.find('.quickedit-vn').each(function () {
             const e = $(this);
@@ -327,30 +345,30 @@
             const name = (e.find('.quickedit-label').text() || e.text()).trim();
             const m = name.match(/(\d{1,3})\|(\d{1,3})(?!.*\d{1,3}\|\d{1,3})/);
             if (!m) return;
-            // V mobilnej verzii (appka) má prehľad inú štruktúru – stĺpcom sa tam neverí.
+            // The mobile version (app) has a different overview layout – columns are not trusted there.
             let points = 0;
             if (!IS_MOBILE) {
                 points = pIdx >= 0 ? num(tds.eq(pIdx).text()) : 0;
                 if (!points) points = num(tds.eq(2).text());
             }
-            list.push({ id, name, coord: `${m[1]}|${m[2]}`, x: +m[1], y: +m[2], points, pointsSrc: points ? 'prehľad produkcie' : '', troops: {} });
+            list.push({ id, name, coord: `${m[1]}|${m[2]}`, x: +m[1], y: +m[2], points, pointsSrc: points ? 'prod' : '', troops: {} });
         });
-        if (!list.length) throw new Error('Nenašli sa žiadne dediny v prehľade produkcie (skontroluj vybranú skupinu).');
-        // Záloha 1: profil hráča (info_player) – aktuálne body, funguje aj v mobilnej appke.
+        if (!list.length) throw new Error(L('No villages found in the production overview (check the selected group).', 'Nenašli sa žiadne dediny v prehľade produkcie (skontroluj vybranú skupinu).'));
+        // Fallback 1: player profile (info_player) – current points, works in the mobile app too.
         if (list.some((v) => !v.points)) {
             try {
                 const prof = await fetchProfilePoints(list);
                 list.forEach((v) => {
                     if (!v.points && prof[v.id]) {
                         v.points = prof[v.id];
-                        v.pointsSrc = 'profil hráča';
+                        v.pointsSrc = 'profile';
                     }
                 });
             } catch (e) {
-                console.warn('DK4: body z profilu sa nepodarilo načítať', e);
+                console.warn('DK4: profile points could not be loaded', e);
             }
         }
-        // Záloha 2: mapa sveta /map/village.txt (aktualizuje sa raz za hodinu).
+        // Fallback 2: world map /map/village.txt (updated hourly).
         if (list.some((v) => !v.points)) {
             try {
                 const map = await loadMap();
@@ -358,11 +376,11 @@
                     const r = map.get(v.coord);
                     if (!v.points && r && r.id === v.id && r.points) {
                         v.points = r.points;
-                        v.pointsSrc = 'mapa sveta (môže byť až 1 h stará)';
+                        v.pointsSrc = 'map';
                     }
                 });
             } catch (e) {
-                console.warn('DK4: body z mapy sa nepodarilo načítať', e);
+                console.warn('DK4: map points could not be loaded', e);
             }
         }
         const troops = await fetchTroops();
@@ -376,8 +394,8 @@
         snapshotAt = now();
     }
 
-    // Body vlastných dedín zo stránky profilu. Hľadá odkaz na každú dedinu (info_village&id=ID)
-    // a z jej riadku/karty vezme číslo, ktoré nie je súčasťou názvu ani súradníc.
+    // Own village points from the profile page: finds the link to each village (info_village&id=ID)
+    // and takes the number from its row/card that is not part of the name or coordinates.
     async function fetchProfilePoints(list) {
         const html = await httpGet(gameUrl('info_player', `&id=${PID}`));
         const doc = $($.parseHTML(html));
@@ -396,13 +414,12 @@
         return out;
     }
 
-    // Prevzaté z pôvodného scriptu (fetchTroopsForCurrentGroup) – funkčná časť.
+    // Taken from Mass Command Timer (fetchTroopsForCurrentGroup) – units at home from the "Combined" overview.
     async function fetchTroops() {
         const html = await httpGet(gameUrl('overview_villages', `&mode=combined&group=${GROUP}&page=-1`));
         const htmlDoc = $.parseHTML(html);
         const out = [];
-        const mobile = $('#mobileHeader').length > 0;
-        if (mobile) {
+        if (IS_MOBILE) {
             $(htmlDoc).find('.overview-container > div').each((i, el) => {
                 const troops = {};
                 $(el).find('.overview-units-row > div.unit-row-item').each((j, ue) => {
@@ -433,14 +450,14 @@
                 out.push(row);
             });
         }
-        if (!out.length) throw new Error('Nepodarilo sa načítať jednotky z prehľadu "Kombinované".');
+        if (!out.length) throw new Error(L('Could not load units from the "Combined" overview.', 'Nepodarilo sa načítať jednotky z prehľadu "Kombinované".'));
         return out;
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Mapa sveta (overenie cieľov) – verejný súbor /map/village.txt      */
+    /*  World map (target check) – public file /map/village.txt            */
+    /*  Downloaded at most once per hour, otherwise read from IndexedDB.   */
     /* ------------------------------------------------------------------ */
-    // Mapa sveta sa sťahuje najviac raz za hodinu (pravidlá knižnice) – medzitým sa číta z IndexedDB v prehliadači.
     let mapIndex = null;
     let mapAt = 0;
     const MAP_TTL = 3600000;
@@ -480,7 +497,7 @@
                 txt = c.text;
                 at = c.at;
             }
-        } catch (e) { /* IndexedDB nedostupná */ }
+        } catch (e) { /* IndexedDB not available */ }
         if (txt === null) {
             const lastTry = +(localStorage.getItem(MAP_DB + '_at') || 0);
             if (mapIndex && Date.now() - lastTry < MAP_TTL) return mapIndex;
@@ -503,7 +520,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Časové okno dopadu (okno – nočný bonus – zakázané intervaly)       */
+    /*  Landing window (window – night bonus – forbidden intervals)        */
     /* ------------------------------------------------------------------ */
     function parseForbidden(str) {
         const out = [];
@@ -513,7 +530,7 @@
             const a = m && parseTime(m[1]);
             const b = m && parseTime(m[2]);
             if (a === null || b === null || !m) bad.push(part);
-            else out.push({ s: a, e: b, label: `zakázané ${m[1]}–${m[2]}` });
+            else out.push({ s: a, e: b, label: L(`forbidden ${m[1]}–${m[2]}`, `zakázané ${m[1]}–${m[2]}`) });
         });
         return { list: out, bad };
     }
@@ -526,15 +543,15 @@
         });
         return res.filter(([a, b]) => b >= a);
     }
-    // Vráti povolené intervaly dopadu [[od, do], ...] (uzavreté, presnosť na sekundy).
+    // Returns allowed landing intervals [[from, to], ...] (closed, second precision).
     function buildArrival() {
         const s = S();
         let list = [];
         if (s.autoDate) {
-            // Automatický dátum: denné okno od dnes na N dní dopredu – každý útok dopadne v najbližšom možnom dni.
+            // Automatic date: daily window from today for N days – every attack lands on the nearest possible day.
             const tf = parseTime(s.from);
             const tt = parseTime(s.to);
-            if (tf === null || tt === null) return { error: 'Neplatný čas dopadu.' };
+            if (tf === null || tt === null) return { error: L('Invalid landing time.', 'Neplatný čas dopadu.') };
             const today = Math.floor(now() / DAY) * DAY;
             const days = Math.max(1, Math.min(60, num(s.autoDays) || 14));
             for (let d = 0; d <= days; d++) {
@@ -548,7 +565,7 @@
         } else {
             const a0 = wallOf(s.date, s.from);
             let b0 = wallOf(s.date, s.to);
-            if (a0 === null || b0 === null) return { error: 'Neplatný dátum alebo čas dopadu.' };
+            if (a0 === null || b0 === null) return { error: L('Invalid landing date or time.', 'Neplatný dátum alebo čas dopadu.') };
             if (b0 < a0) b0 += DAY;
             list = [[a0, b0]];
         }
@@ -556,26 +573,26 @@
         const b = list[list.length - 1][1];
         const blocks = [];
         if (cfg.night.active && cfg.night.start !== cfg.night.end) {
-            blocks.push({ s: cfg.night.start * 3600000, e: cfg.night.end * 3600000, label: `nočný bonus ${pad(cfg.night.start)}:00–${pad(cfg.night.end)}:00` });
+            blocks.push({ s: cfg.night.start * 3600000, e: cfg.night.end * 3600000, label: L(`night bonus ${pad(cfg.night.start)}:00–${pad(cfg.night.end)}:00`, `nočný bonus ${pad(cfg.night.start)}:00–${pad(cfg.night.end)}:00`) });
         }
         const fb = parseForbidden(s.forbidden);
-        if (fb.bad.length) return { error: 'Neplatný zakázaný interval: ' + fb.bad.join(', ') + ' (formát 12:00-13:30)' };
+        if (fb.bad.length) return { error: L('Invalid forbidden interval: ', 'Neplatný zakázaný interval: ') + fb.bad.join(', ') + L(' (format 12:00-13:30)', ' (formát 12:00-13:30)') };
         blocks.push(...fb.list);
         const removed = [];
         for (let day = Math.floor(a / DAY) * DAY - DAY; day <= b + DAY; day += DAY) {
             blocks.forEach((bl) => {
                 const bs = day + bl.s;
-                const be = bl.e > bl.s ? day + bl.e : day + DAY + bl.e; // cez polnoc
+                const be = bl.e > bl.s ? day + bl.e : day + DAY + bl.e; // over midnight
                 if (be < a || bs > b) return;
                 const before = JSON.stringify(list);
                 list = subtract(list, bs, be);
                 if (JSON.stringify(list) !== before) removed.push(`${bl.label} (${fmtShort(bs)} – ${fmtShort(be)})`);
             });
         }
-        if (!list.length) return { error: 'Celé okno dopadu padá do nočného bonusu alebo zakázaných intervalov.', removed };
+        if (!list.length) return { error: L('The whole landing window falls into the night bonus or forbidden intervals.', 'Celé okno dopadu padá do nočného bonusu alebo zakázaných intervalov.'), removed };
         return { list, removed };
     }
-    // Okná odoslania pre daný čas pochodu (s rezervou na potvrdenie).
+    // Send windows for a given travel time (with a buffer for confirming).
     function sendWindows(arrival, travelMs, buffer, from) {
         const out = [];
         arrival.forEach(([a, b]) => {
@@ -588,9 +605,9 @@
     const inArrival = (arrival, t, buffer = 0) => arrival.some(([a, b]) => t >= a && t + buffer <= b);
 
     /* ------------------------------------------------------------------ */
-    /*  MODUL VÝPOČTU JEDNOTIEK                                            */
+    /*  UNIT CALCULATION                                                   */
     /* ------------------------------------------------------------------ */
-    // Dostupné jednotky = doma (snapshot) − rezerva − rezervované vo fronte − odoslané po snapshote.
+    // Available units = at home (snapshot) − reserve − reserved in queue − sent after snapshot.
     function reservedMap(excludeId) {
         const map = {};
         state.queue.forEach((q) => {
@@ -605,7 +622,7 @@
     function available(v, reserved, ownItem) {
         const r = reserved[v.id] || {};
         const keep = S().reserve || {};
-        const back = ownItem ? ownItem.units : {}; // vlastná rezervácia útoku sa vráti späť
+        const back = ownItem ? ownItem.units : {}; // the attack's own reservation is given back
         const out = {};
         GAME_UNITS.forEach((u) => (out[u] = Math.max(0, (v.troops[u] || 0) - (keep[u] || 0) - (r[u] || 0) + (back[u] || 0))));
         return out;
@@ -615,17 +632,17 @@
 
     function classify(v) {
         const ov = (S().override || {})[v.id] || 'auto';
-        if (ov === 'skip') return { type: 'SKIP', why: 'vylúčená používateľom' };
-        if (!v.hasTroopData) return { type: 'NONE', why: 'chýbajú údaje o jednotkách' };
+        if (ov === 'skip') return { type: 'SKIP', why: L('excluded by user', 'vylúčená používateľom') };
+        if (!v.hasTroopData) return { type: 'NONE', why: L('no unit data', 'chýbajú údaje o jednotkách') };
         const t = v.troops;
         const offPop = OFF_CLASS.filter((u) => cfg.units[u]).reduce((s, u) => s + (t[u] || 0) * pop(u), 0);
         const defPop = DEFF_CLASS.filter((u) => cfg.units[u]).reduce((s, u) => s + (t[u] || 0) * pop(u), 0);
-        if (ov === 'off') return { type: 'OFF', offPop, defPop, why: 'nastavené ručne' };
-        if (ov === 'deff') return { type: 'DEFF', offPop, defPop, why: 'nastavené ručne' };
-        if (!offPop && !defPop) return { type: 'NONE', offPop, defPop, why: 'bez útočných aj obranných jednotiek' };
+        if (ov === 'off') return { type: 'OFF', offPop, defPop, why: L('set manually', 'nastavené ručne') };
+        if (ov === 'deff') return { type: 'DEFF', offPop, defPop, why: L('set manually', 'nastavené ručne') };
+        if (!offPop && !defPop) return { type: 'NONE', offPop, defPop, why: L('no offensive or defensive units', 'bez útočných aj obranných jednotiek') };
         return offPop >= defPop
-            ? { type: 'OFF', offPop, defPop, why: `útočná populácia ${fmtNum(offPop)} ≥ obranná ${fmtNum(defPop)}` }
-            : { type: 'DEFF', offPop, defPop, why: `obranná populácia ${fmtNum(defPop)} > útočná ${fmtNum(offPop)}` };
+            ? { type: 'OFF', offPop, defPop, why: L(`offensive pop. ${fmtNum(offPop)} ≥ defensive ${fmtNum(defPop)}`, `útočná populácia ${fmtNum(offPop)} ≥ obranná ${fmtNum(defPop)}`) }
+            : { type: 'DEFF', offPop, defPop, why: L(`defensive pop. ${fmtNum(defPop)} > offensive ${fmtNum(offPop)}`, `obranná populácia ${fmtNum(defPop)} > útočná ${fmtNum(offPop)}`) };
     }
 
     const orderFrom = (str, allowed) => {
@@ -634,7 +651,7 @@
         return list;
     };
 
-    // Vyskúša jednotlivé varianty a potom kombináciu; vráti najmenšiu vyhovujúcu zostavu.
+    // Tries single-unit variants first, then a combination; returns the smallest valid set.
     function fillPop(need, order, avail) {
         if (need <= 0) return { units: {} };
         for (const u of order) {
@@ -656,11 +673,15 @@
 
     function composeFake(v, kind, avail) {
         const minPop = minPopFor(v);
-        const ex = [`Body dediny ${fmtNum(v.points)}${v.pointsSrc ? ` (zdroj: ${v.pointsSrc})` : ''} × ${fakeLimit()} % = ${((v.points * fakeLimit()) / 100).toFixed(2)} → minimum ${minPop} obyv.${fromMap(v) ? ` (vrátane rezervy +${MAP_SAFETY_PCT} %, lebo body sú z mapy)` : ""}`];
-        if (!v.points) return { ok: false, reason: 'neznáme body dediny', ex };
+        const raw = ((v.points * fakeLimit()) / 100).toFixed(2);
+        const src = srcLabel(v) ? L(` (source: ${srcLabel(v)})`, ` (zdroj: ${srcLabel(v)})`) : '';
+        const margin = fromMap(v) ? L(` (incl. +${MAP_SAFETY_PCT} % margin, points from the map)`, ` (vrátane rezervy +${MAP_SAFETY_PCT} %, lebo body sú z mapy)`) : '';
+        const ex = [L(`Village points ${fmtNum(v.points)}${src} × ${fakeLimit()} % = ${raw} → minimum ${minPop} pop.${margin}`,
+            `Body dediny ${fmtNum(v.points)}${src} × ${fakeLimit()} % = ${raw} → minimum ${minPop} obyv.${margin}`)];
+        if (!v.points) return { ok: false, reason: L('unknown village points', 'neznáme body dediny'), ex };
         let units = null;
         if (kind === 'OFF') {
-            if (!cfg.units.ram || (avail.ram || 0) < 1) return { ok: false, reason: 'žiadne dostupné baranidlá', ex };
+            if (!cfg.units.ram || (avail.ram || 0) < 1) return { ok: false, reason: L('no rams available', 'žiadne dostupné baranidlá'), ex };
             const order = orderFrom(S().offOrder, OFF_FILLERS);
             const maxR = Math.max(1, Math.min(num(S().maxRams) || 1, avail.ram));
             let lastMissing = 0;
@@ -668,40 +689,41 @@
                 const f = fillPop(minPop - r * pop('ram'), order, avail);
                 if (f.units) {
                     units = { ...f.units, ram: r };
-                    ex.push(`Baranidlá: ${r} × ${pop('ram')} obyv.; doplnenie v poradí ${order.map((u) => UNIT_NAME[u]).join(' → ')}.`);
+                    ex.push(L(`Rams: ${r} × ${pop('ram')} pop.; filled in order ${order.map(uName).join(' → ')}.`, `Baranidlá: ${r} × ${pop('ram')} obyv.; doplnenie v poradí ${order.map(uName).join(' → ')}.`));
                 } else lastMissing = f.missing;
             }
-            if (!units) return { ok: false, reason: `nedostatok jednotiek (chýba ${lastMissing} obyv.)`, ex };
+            if (!units) return { ok: false, reason: L(`not enough units (missing ${lastMissing} pop.)`, `nedostatok jednotiek (chýba ${lastMissing} obyv.)`), ex };
         } else {
             const order = orderFrom(S().deffOrder, DEFF_FILLERS);
             const f = fillPop(minPop, order, avail);
-            if (!f.units) return { ok: false, reason: `nedostatok kopijníkov/mečiarov (chýba ${f.missing} obyv.)`, ex };
+            if (!f.units) return { ok: false, reason: L(`not enough spear fighters/swordsmen (missing ${f.missing} pop.)`, `nedostatok kopijníkov/mečiarov (chýba ${f.missing} obyv.)`), ex };
             units = f.units;
-            ex.push(`Obranné jednotky v poradí ${order.map((u) => UNIT_NAME[u]).join(' → ')} (bez ťažkej jazdy).`);
+            ex.push(L(`Defensive units in order ${order.map(uName).join(' → ')} (no heavy cavalry).`, `Obranné jednotky v poradí ${order.map(uName).join(' → ')} (bez ťažkej jazdy).`));
         }
         const p = popOf(units);
         const slow = slowest(units);
-        ex.push(`Zostava ${unitsText(units)} = ${p} obyv. (≥ ${minPop} ✓). Najpomalšia jednotka: ${UNIT_NAME[slow]} (${speed(slow).toFixed(2)} min/pole).`);
+        ex.push(L(`Set ${unitsText(units)} = ${p} pop. (≥ ${minPop} ✓). Slowest unit: ${uName(slow)} (${speed(slow).toFixed(2)} min/field).`,
+            `Zostava ${unitsText(units)} = ${p} obyv. (≥ ${minPop} ✓). Najpomalšia jednotka: ${uName(slow)} (${speed(slow).toFixed(2)} min/pole).`));
         return { ok: true, units, pop: p, minPop, slow, ex };
     }
 
-    // Kontrola zostavy podľa kategórie – volá sa pri plánovaní aj pred každým odoslaním.
+    // Category check of a unit set – used when planning and before every opening.
     function validateComposition(item, v, avail) {
         const errs = [];
         const u = item.units;
-        unitList(u).forEach((k) => { if (!ALLOWED_UNITS.has(k)) errs.push(`nepovolená jednotka ${UNIT_NAME[k] || k}`); });
-        if (item.kind === 'OFF' && !(u.ram > 0)) errs.push('OFF fake bez baranidla');
-        if (item.kind === 'DEFF' && unitList(u).some((k) => !DEFF_FILLERS.includes(k))) errs.push('DEFF fake smie obsahovať len kopijníkov a mečiarov');
+        unitList(u).forEach((k) => { if (!ALLOWED_UNITS.has(k)) errs.push(L(`unit not allowed: ${uName(k)}`, `nepovolená jednotka ${uName(k)}`)); });
+        if (item.kind === 'OFF' && !(u.ram > 0)) errs.push(L('OFF fake without a ram', 'OFF fake bez baranidla'));
+        if (item.kind === 'DEFF' && unitList(u).some((k) => !DEFF_FILLERS.includes(k))) errs.push(L('DEFF fake may contain only spear fighters and swordsmen', 'DEFF fake smie obsahovať len kopijníkov a mečiarov'));
         if (v) {
             const minPop = minPopFor(v);
-            if (popOf(u) < minPop) errs.push(`populácia ${popOf(u)} < minimum ${minPop}`);
-            if (avail) unitList(u).forEach((k) => { if ((avail[k] || 0) < u[k]) errs.push(`nedostatok: ${UNIT_NAME[k]} ${avail[k] || 0}/${u[k]}`); });
+            if (popOf(u) < minPop) errs.push(L(`population ${popOf(u)} < minimum ${minPop}`, `populácia ${popOf(u)} < minimum ${minPop}`));
+            if (avail) unitList(u).forEach((k) => { if ((avail[k] || 0) < u[k]) errs.push(L(`not enough: ${uName(k)} ${avail[k] || 0}/${u[k]}`, `nedostatok: ${uName(k)} ${avail[k] || 0}/${u[k]}`)); });
         }
         return errs;
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Overenie súradníc                                                  */
+    /*  Coordinate check                                                   */
     /* ------------------------------------------------------------------ */
     async function validateTargets() {
         const s = S();
@@ -747,7 +769,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /*  PLÁNOVANIE                                                         */
+    /*  PLANNING                                                           */
     /* ------------------------------------------------------------------ */
     function planTargets(targets) {
         const s = S();
@@ -769,14 +791,18 @@
         const failed = [];
         const per = Math.max(1, Math.min(50, num(s.perTarget) || 1));
         let timeFails = 0;
+        const R_TIME = L('cannot land in the window', 'nestihne dopadnúť v okne');
+        const R_PAIR = L('already attacks this target', 'už útočí na tento cieľ');
+        const R_LIMIT = L('attack limit per village', 'limit útokov na dedinu');
 
         targets.forEach((t) => {
             for (let k = 0; k < per; k++) {
-                if ((t.info.kind === 'own' || t.info.kind === 'missing')) {
-                    failed.push({ t, why: t.info.kind === 'own' ? 'vlastná dedina' : 'na súradniciach nie je dedina' });
+                if (t.info.kind === 'own' || t.info.kind === 'missing') {
+                    failed.push({ t, why: t.info.kind === 'own' ? L('own village', 'vlastná dedina') : L('no village at these coordinates', 'na súradniciach nie je dedina') });
                     break;
                 }
                 const rej = {};
+                const reject = (r) => (rej[r] = (rej[r] || 0) + 1);
                 let best = null;
                 let earliest = Infinity;
                 let considered = 0;
@@ -788,15 +814,15 @@
                     considered++;
                     const d = dist(v, t);
                     if (d === 0) return;
-                    if (pairs.has(v.id + '|' + t.coord)) { rej['už útočí na tento cieľ'] = (rej['už útočí na tento cieľ'] || 0) + 1; return; }
-                    if (num(s.maxPerVillage) && (usage[v.id] || 0) >= num(s.maxPerVillage)) { rej['limit útokov na dedinu'] = (rej['limit útokov na dedinu'] || 0) + 1; return; }
+                    if (pairs.has(v.id + '|' + t.coord)) return reject(R_PAIR);
+                    if (num(s.maxPerVillage) && (usage[v.id] || 0) >= num(s.maxPerVillage)) return reject(R_LIMIT);
                     const av = available(v, reserved);
                     const comp = composeFake(v, c.type, av);
-                    if (!comp.ok) { rej[comp.reason.replace(/\(.*\)/, '').trim()] = (rej[comp.reason.replace(/\(.*\)/, '').trim()] || 0) + 1; return; }
+                    if (!comp.ok) return reject(comp.reason.replace(/\(.*\)/, '').trim());
                     const travel = Math.round(d * speed(comp.slow) * 60) * 1000;
                     const sw = sendWindows(arr.list, travel, buffer, t0);
                     if (!sw.length) {
-                        rej['nestihne dopadnúť v okne'] = (rej['nestihne dopadnúť v okne'] || 0) + 1;
+                        reject(R_TIME);
                         earliest = Math.min(earliest, t0 + travel);
                         return;
                     }
@@ -806,14 +832,15 @@
                     }
                 });
                 if (!best) {
-                    const why = Object.entries(rej).map(([r, n]) => `${r}: ${n}×`).join(', ') || (considered ? 'žiadna vhodná dedina' : 'žiadna použiteľná OFF/DEFF dedina');
+                    const why = Object.entries(rej).map(([r, n]) => `${r}: ${n}×`).join(', ') || (considered ? L('no suitable village', 'žiadna vhodná dedina') : L('no usable OFF/DEFF village', 'žiadna použiteľná OFF/DEFF dedina'));
                     let hint = '';
                     if (isFinite(earliest)) {
                         timeFails++;
                         const tTo = parseTime(s.to) || 0;
                         const dayStart = Math.floor(earliest / DAY) * DAY;
                         const sugg = earliest - dayStart > tTo ? dayStart + DAY : dayStart;
-                        hint = ` · najbližšia dedina dopadne najskôr ${fmt(earliest)} → nastav dátum dopadu aspoň ${fmt(sugg).slice(0, 10)} alebo zapni Automatický dátum`;
+                        hint = L(` · the nearest village lands at ${fmt(earliest)} at the earliest → set the landing date to ${fmt(sugg).slice(0, 10)} or later, or turn on Automatic date`,
+                            ` · najbližšia dedina dopadne najskôr ${fmt(earliest)} → nastav dátum dopadu aspoň ${fmt(sugg).slice(0, 10)} alebo zapni Automatický dátum`);
                     }
                     failed.push({ t, why: why + hint });
                     break;
@@ -841,21 +868,21 @@
                     reason: '',
                     createdAt: now(),
                     why: [
-                        `Typ dediny: ${c.type} (${c.why}).`,
+                        L(`Village type: ${c.type} (${c.why}).`, `Typ dediny: ${c.type} (${c.why}).`),
                         ...comp.ex,
-                        `Vzdialenosť ${d.toFixed(2)} polí × ${speed(comp.slow).toFixed(2)} min = čas pochodu ${fmtDur(travel / 1000)}.`,
-                        `Vybraná z ${considered} kandidátov: najmenej použitá (${usage[v.id] || 0}× vo fronte), pri zhode najbližšia.`,
-                        `Prvé možné odoslanie ${fmt(sw[0][0])} → dopad ${fmt(sw[0][0] + travel)}.`,
-                        Object.keys(rej).length ? `Vyradené dediny: ${Object.entries(rej).map(([r, n]) => `${r} ${n}×`).join(', ')}.` : '',
+                        L(`Distance ${d.toFixed(2)} fields × ${speed(comp.slow).toFixed(2)} min = travel time ${fmtDur(travel / 1000)}.`, `Vzdialenosť ${d.toFixed(2)} polí × ${speed(comp.slow).toFixed(2)} min = čas pochodu ${fmtDur(travel / 1000)}.`),
+                        L(`Chosen from ${considered} candidates: least used (${usage[v.id] || 0}× in queue), nearest on a tie.`, `Vybraná z ${considered} kandidátov: najmenej použitá (${usage[v.id] || 0}× vo fronte), pri zhode najbližšia.`),
+                        L(`Earliest send ${fmt(sw[0][0])} → landing ${fmt(sw[0][0] + travel)}.`, `Prvé možné odoslanie ${fmt(sw[0][0])} → dopad ${fmt(sw[0][0] + travel)}.`),
+                        Object.keys(rej).length ? L(`Excluded villages: `, `Vyradené dediny: `) + Object.entries(rej).map(([r, n]) => `${r} ${n}×`).join(', ') + '.' : '',
                     ].filter(Boolean),
                     log: [],
                 };
                 const errs = validateComposition(item, v, best.av);
                 if (errs.length) {
-                    failed.push({ t, why: 'kontrola zostavy zlyhala: ' + errs.join('; ') });
+                    failed.push({ t, why: L('unit set check failed: ', 'kontrola zostavy zlyhala: ') + errs.join('; ') });
                     break;
                 }
-                log(item, `Naplánovaný z ${v.name}`);
+                log(item, L(`Planned from ${v.name}`, `Naplánovaný z ${v.name}`));
                 state.queue.push(item);
                 created.push(item);
                 usage[v.id] = (usage[v.id] || 0) + 1;
@@ -868,14 +895,14 @@
         return { created, failed, removed: arr.removed, timeFails };
     }
 
-    // Preplánovanie chybného útoku – uvoľní jednotky a hľadá inú dedinu.
+    // Re-plan a failed attack – releases its units and looks for another village.
     function replan(item) {
         if (!['error', 'unverified', 'pending', 'ready'].includes(item.status)) return;
         const exclude = item.sourceId;
         const target = { coord: item.target, x: +item.target.split('|')[0], y: +item.target.split('|')[1], info: item.targetInfo };
         item.status = 'removed';
-        item.reason = 'Preplánované';
-        log(item, 'Odstránený kvôli preplánovaniu');
+        item.reason = L('Re-planned', 'Preplánované');
+        log(item, L('Removed because of re-planning', 'Odstránený kvôli preplánovaniu'));
         const saveOv = { ...(S().override || {}) };
         S().override = { ...saveOv, [exclude]: 'skip' };
         const savedPer = S().perTarget;
@@ -888,21 +915,21 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Vyhodnotenie stavu útokov (každú sekundu)                          */
+    /*  Attack status (evaluated every second – display only)              */
     /* ------------------------------------------------------------------ */
     function evaluate(item, t, reserved) {
         if (!['pending', 'ready'].includes(item.status)) return;
         const v = villages.find((x) => x.id === item.sourceId);
         if (!v) {
             item.status = 'error';
-            item.reason = 'Vysielajúca dedina sa nenašla v aktuálnej skupine.';
+            item.reason = L('Sending village not found in the current group.', 'Vysielajúca dedina sa nenašla v aktuálnej skupine.');
             return;
         }
         const errs = validateComposition(item, v, available(v, reserved, item));
         if (errs.length) {
             item.status = 'error';
             item.reason = errs.join('; ');
-            log(item, 'Chyba: ' + item.reason);
+            log(item, L('Error: ', 'Chyba: ') + item.reason);
             return;
         }
         if (inArrival(item.arrival, t + item.travel, item.buffer)) {
@@ -916,7 +943,7 @@
             item.reason = '';
         } else {
             item.status = 'error';
-            item.reason = 'Okno odoslania uplynulo – útok by dopadol mimo povoleného času.';
+            item.reason = L('Send window has passed – the attack would land outside the allowed time.', 'Okno odoslania uplynulo – útok by dopadol mimo povoleného času.');
             log(item, item.reason);
         }
     }
@@ -937,7 +964,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Odosielanie (vždy s potvrdením hráčom v nádvorí)                 */
+    /*  Sending (always confirmed by the player in the rally point)        */
     /* ------------------------------------------------------------------ */
     let monitor = null;
     let session = { running: false, current: null, skipped: new Set() };
@@ -975,20 +1002,16 @@
         return cmds.filter((c) => c.srcIds.has(String(item.sourceId)) && (re.test(c.label) || re.test(c.text)));
     }
 
-    // Overenie odoslania v prehľade príkazov. Nový príkaz = nebol v "before" a nie je priradený inému útoku.
-    async function verifySent(item, tries) {
+    // Manual verification (button click): ONE request to the commands overview.
+    // New command = not in "before" and not assigned to another attack.
+    async function verifySent(item) {
         const claimed = claimedIds();
-        for (let i = 0; i < tries; i++) {
-            if (i) await sleep(1500 * i);
-            let cmds;
-            try {
-                cmds = await fetchCommands();
-            } catch (e) {
-                log(item, 'Overenie: ' + e.message);
-                continue;
-            }
+        try {
+            const cmds = await fetchCommands();
             const fresh = matchCommands(item, cmds).filter((c) => !claimed.has(c.cmdId) && !(item.before || []).includes(c.cmdId));
             if (fresh.length) return { found: true, cmd: fresh[0], extra: fresh.length - 1 };
+        } catch (e) {
+            log(item, L('Verification: ', 'Overenie: ') + e.message);
         }
         return { found: false };
     }
@@ -998,29 +1021,29 @@
         item.status = 'sent';
         item.sentAt = now();
         item.commandId = r && r.cmd ? r.cmd.cmdId : item.commandId || null;
-        item.reason = r && r.extra ? `Pozor: nájdených ${r.extra + 1} nových príkazov z tejto dediny na cieľ.` : '';
-        log(item, `Odoslanie overené (${how})${item.commandId ? ', príkaz #' + item.commandId : ''}`);
+        item.reason = r && r.extra ? L(`Note: ${r.extra + 1} new commands from this village to the target were found.`, `Pozor: nájdených ${r.extra + 1} nových príkazov z tejto dediny na cieľ.`) : '';
+        log(item, L(`Sending verified (${how})`, `Odoslanie overené (${how})`) + (item.commandId ? L(', command #', ', príkaz #') + item.commandId : ''));
         save();
-        if (window.UI && UI.SuccessMessage) UI.SuccessMessage(`Útok #${item.no} na ${item.target} odoslaný ✓`);
+        if (window.UI && UI.SuccessMessage) UI.SuccessMessage(L(`Attack #${item.no} to ${item.target} sent ✓`, `Útok #${item.no} na ${item.target} odoslaný ✓`));
     }
 
     function precheck(item) {
         const t = now();
         const reserved = reservedMap();
         evaluate(item, t, reserved);
-        if (item.status !== 'ready') return item.reason || 'Útok nie je pripravený (mimo okna odoslania).';
-        if (!inArrival(item.arrival, t + item.travel, item.buffer)) return 'Dopad by bol mimo povoleného okna.';
+        if (item.status !== 'ready') return item.reason || L('The attack is not ready (outside the send window).', 'Útok nie je pripravený (mimo okna odoslania).');
+        if (!inArrival(item.arrival, t + item.travel, item.buffer)) return L('The attack would land outside the allowed window.', 'Dopad by bol mimo povoleného okna.');
         return '';
     }
 
     /*
-     * Odosielanie (verzia na schválenie):
-     *  - Nádvorie sa načíta do rámu v paneli, predvyplnené cez URL (x, y, jednotky).
-     *  - Útok odošle hráč v nádvorí sám (Útok → Poslať útok). Script na stránke hry nič nemení.
-     *  - Ďalší útok načíta až kliknutie hráča na "ĎALŠÍ ÚTOK ▶" (jedno kliknutie = jedna akcia).
-     *    Pri tom kliknutí script prečíta tabuľku "Vlastné príkazy" v ráme (bez požiadavky na server)
-     *    a predchádzajúci útok označí ako odoslaný.
-     *  - Script na nič nereaguje sám a bez kliknutia neposiela žiadne požiadavky.
+     * Sending:
+     *  - The rally point is loaded into a frame in the panel, pre-filled via URL (x, y, units).
+     *  - The player sends the attack in the rally point himself (Attack → Send attack). Nothing is changed on the game page.
+     *  - The next attack is loaded only by the player's click on "NEXT ATTACK ▶" (one click = one action).
+     *    On that click the script reads the "Own commands" table in the frame (no server request)
+     *    and marks the previous attack as sent.
+     *  - The script never reacts on its own and sends no requests without a click.
      */
     function sendWin() {
         const f = document.getElementById('dk4-frame');
@@ -1050,7 +1073,7 @@
         const col = level === 'ok' ? '#2e7d32' : level === 'warn' ? '#b26a00' : level === 'err' ? '#c62828' : '#3d2f1a';
         $('#dk4-sendinfo').html(html).css({ background: col });
     }
-    // Vlastné útoky danej dediny na cieľ – z tabuľky "Vlastné príkazy" na nádvorí.
+    // Own attacks of a village to a target – from the "Own commands" table in the rally point.
     function outgoingMatches(doc, item) {
         const table = doc && doc.getElementById('commands_outgoings');
         if (!table) return { table: false, ids: [] };
@@ -1059,12 +1082,12 @@
         table.querySelectorAll('.quickedit-out[data-id]').forEach((el) => {
             const label = (el.querySelector('.quickedit-label') || el).textContent || '';
             const typ = el.querySelector('[data-command-type]');
-            const isAttack = typ ? typ.getAttribute('data-command-type') === 'attack' : /útok/i.test(label);
+            const isAttack = typ ? typ.getAttribute('data-command-type') === 'attack' : /útok|attack/i.test(label);
             if (isAttack && re.test(label)) ids.push(String(el.getAttribute('data-id')));
         });
         return { table: true, ids };
     }
-    // Bol útok odoslaný? Číta len stránku, ktorá je práve v ráme.
+    // Was the attack sent? Reads only the page currently shown in the frame.
     function checkSentInFrame(item) {
         const doc = frameDoc();
         if (!doc) return { found: false };
@@ -1078,9 +1101,9 @@
         return fresh.length ? { found: true, cmd: { cmdId: fresh[0] }, extra: fresh.length - 1 } : { found: false };
     }
 
-    // Načíta nádvorie pre útok do rámu (jedna akcia).
+    // Loads the rally point of an attack into the frame (one action).
     function openSend(item) {
-        if (item.status === 'sent' || item.status === 'progress') return 'Útok je už odoslaný alebo otvorený.';
+        if (item.status === 'sent' || item.status === 'progress') return L('The attack is already sent or open.', 'Útok je už odoslaný alebo otvorený.');
         const err = precheck(item);
         if (err) {
             render();
@@ -1088,21 +1111,21 @@
         }
         showFrame(true);
         const win = sendWin();
-        if (!win) return 'Nádvorie sa nepodarilo načítať do panelu.';
+        if (!win) return L('The rally point could not be loaded into the panel.', 'Nádvorie sa nepodarilo načítať do panelu.');
         item.status = 'progress';
         item.reason = '';
-        log(item, 'Načítané nádvorie (Útok → Poslať útok)');
+        log(item, L('Rally point loaded (Attack → Send attack)', 'Načítané nádvorie (Útok → Poslať útok)'));
         save();
         stopMonitor();
         startMonitor(item, win);
         session.current = item;
-        sendInfo(`Načítavam nádvorie: útok #${item.no} · ${esc(item.sourceName)} → <b>${esc(item.target)}</b>…`);
+        sendInfo(L(`Loading rally point: attack #${item.no} · ${esc(item.sourceName)} → <b>${esc(item.target)}</b>…`, `Načítavam nádvorie: útok #${item.no} · ${esc(item.sourceName)} → <b>${esc(item.target)}</b>…`));
         win.location.href = placeUrl(item);
         render();
         return '';
     }
 
-    // Monitor len ZOBRAZUJE kontroly v paneli (nič nemení, nič neodosiela, na nič nereaguje).
+    // The monitor only DISPLAYS checks in the panel (changes nothing, sends nothing, reacts to nothing).
     function startMonitor(item, win) {
         let initialDoc = null;
         try { initialDoc = win.document; } catch (e) { /* ignore */ }
@@ -1140,26 +1163,26 @@
         if (isForm && new RegExp(`[?&]village=${item.sourceId}(&|$)`).test(href)) formStage(doc, m);
     }
 
-    // Stav útoku sa zobrazuje iba v paneli scriptu (mimo stránky hry).
+    // Attack status is shown only in the script panel (outside the game page).
     function setBanner(item, html, level) {
-        const inner = `<b>Útok #${item.no}</b> · ${esc(item.kind)} FAKE · ${esc(item.sourceName)} → <b>${esc(item.target)}</b> · ${esc(unitsText(item.units))} (${item.pop}/${item.minPop} obyv.)<br>${html}`;
+        const inner = `<b>${L('Attack', 'Útok')} #${item.no}</b> · ${esc(item.kind)} FAKE · ${esc(item.sourceName)} → <b>${esc(item.target)}</b> · ${esc(unitsText(item.units))} (${item.pop}/${item.minPop} ${popWord()})<br>${html}`;
         if ($('#dk4-sendinfo').html() !== inner) sendInfo(inner, level);
     }
 
     function formStage(doc, m) {
         const item = m.item;
-        // Ak sa útok už objavil vo "Vlastných príkazoch", hráč ho odoslal – len to oznámime.
+        // If the attack already appears in "Own commands", the player has sent it – just show it.
         if (item.before && checkSentInFrame(item).found) {
-            setBanner(item, 'Útok bol odoslaný ✓ · Klikni <b>ĎALŠÍ ÚTOK ▶</b>.', 'ok');
+            setBanner(item, L('Attack sent ✓ · Click <b>NEXT ATTACK ▶</b>.', 'Útok bol odoslaný ✓ · Klikni <b>ĎALŠÍ ÚTOK ▶</b>.'), 'ok');
             return;
         }
         if (!m.prepared) {
             m.prepared = true;
-            // stav "pred odoslaním" – vlastné príkazy z tejto dediny na cieľ
+            // "before sending" state – existing own commands from this village to the target
             const local = outgoingMatches(doc, item);
             item.before = Array.from(new Set([...(item.before || []), ...local.ids]));
             save();
-            // predvyplnenie (URL to už spravila; toto len opraví rozdiely – rovnako ako iné fake scripty)
+            // pre-fill (the URL already did it; this only fixes differences – like other fake scripts)
             GAME_UNITS.forEach((u) => {
                 const inp = doc.getElementById('unit_input_' + u);
                 if (!inp) return;
@@ -1177,11 +1200,13 @@
             unitList(item.units).forEach((u) => {
                 const a = doc.getElementById('units_entry_all_' + u);
                 const have = a ? num((a.textContent.match(/\d[\d.\s]*/) || ['0'])[0]) : 0;
-                if (have < item.units[u]) lacking.push(`${UNIT_NAME[u]} ${have}/${item.units[u]}`);
+                if (have < item.units[u]) lacking.push(`${uName(u)} ${have}/${item.units[u]}`);
             });
             if (lacking.length || !targetOk) {
                 item.status = 'error';
-                item.reason = lacking.length ? 'Na nádvorí nie je dosť jednotiek: ' + lacking.join(', ') : 'Cieľ sa nepredvyplnil správne.';
+                item.reason = lacking.length
+                    ? L('Not enough units in the rally point: ', 'Na nádvorí nie je dosť jednotiek: ') + lacking.join(', ')
+                    : L('The target was not pre-filled correctly.', 'Cieľ sa nepredvyplnil správne.');
                 log(item, item.reason);
                 m.failed = item.reason;
                 save();
@@ -1189,14 +1214,14 @@
             }
         }
         if (m.failed) {
-            setBanner(item, `NEODOSIELAJ – ${esc(m.failed)}<br>Klikni <b>ĎALŠÍ ÚTOK ▶</b> pre ďalší útok.`, 'err');
+            setBanner(item, L(`DO NOT SEND – ${esc(m.failed)}<br>Click <b>NEXT ATTACK ▶</b> for the next attack.`, `NEODOSIELAJ – ${esc(m.failed)}<br>Klikni <b>ĎALŠÍ ÚTOK ▶</b> pre ďalší útok.`), 'err');
             return;
         }
         const arr = now() + item.travel;
         if (inArrival(item.arrival, arr, 0)) {
-            setBanner(item, `Skontrolované ✓ · dopad pri odoslaní teraz: <b>${fmt(arr)}</b><br>V nádvorí klikni <b>Útok</b>.`, 'ok');
+            setBanner(item, L(`Checked ✓ · landing if sent now: <b>${fmt(arr)}</b><br>Click <b>Attack</b> in the rally point.`, `Skontrolované ✓ · dopad pri odoslaní teraz: <b>${fmt(arr)}</b><br>V nádvorí klikni <b>Útok</b>.`), 'ok');
         } else {
-            setBanner(item, `NEODOSIELAJ: útok by teraz dopadol <b>${fmt(arr)}</b> – mimo povoleného okna.`, 'err');
+            setBanner(item, L(`DO NOT SEND: the attack would land at <b>${fmt(arr)}</b> – outside the allowed window.`, `NEODOSIELAJ: útok by teraz dopadol <b>${fmt(arr)}</b> – mimo povoleného okna.`), 'err');
         }
     }
 
@@ -1210,71 +1235,73 @@
         };
         const problems = [];
         const [x, y] = item.target.split('|');
-        if (val('source_village') !== null && val('source_village') !== String(item.sourceId)) problems.push('iná vysielajúca dedina');
-        if (val('x') !== null && (val('x') !== x || val('y') !== y)) problems.push('iný cieľ');
-        if (val('attack') !== null && val('attack') !== 'true') problems.push('nie je to útok');
+        if (val('source_village') !== null && val('source_village') !== String(item.sourceId)) problems.push(L('different sending village', 'iná vysielajúca dedina'));
+        if (val('x') !== null && (val('x') !== x || val('y') !== y)) problems.push(L('different target', 'iný cieľ'));
+        if (val('attack') !== null && val('attack') !== 'true') problems.push(L('not an attack', 'nie je to útok'));
         GAME_UNITS.forEach((u) => {
             const v = val(u);
             if (v === null) return;
-            if ((+v || 0) !== (item.units[u] || 0)) problems.push(`${UNIT_NAME[u] || u}: ${v} namiesto ${item.units[u] || 0}`);
+            if ((+v || 0) !== (item.units[u] || 0)) problems.push(L(`${uName(u)}: ${v} instead of ${item.units[u] || 0}`, `${uName(u)}: ${v} namiesto ${item.units[u] || 0}`));
         });
         const arr = now() + item.travel;
-        if (!inArrival(item.arrival, arr, 0)) problems.push(`dopad ${fmt(arr)} je mimo povoleného okna`);
+        if (!inArrival(item.arrival, arr, 0)) problems.push(L(`landing ${fmt(arr)} is outside the allowed window`, `dopad ${fmt(arr)} je mimo povoleného okna`));
         let gameDur = null;
         form.querySelectorAll('tr').forEach((tr) => {
             const cells = tr.querySelectorAll('td');
-            if (gameDur !== null || cells.length < 2 || !/trvanie|duration/i.test(cells[0].textContent || '')) return;
+            if (gameDur !== null || cells.length < 2 || !/trvanie|duration|dauer/i.test(cells[0].textContent || '')) return;
             const mm = (cells[1].textContent || '').trim().match(/(\d+):(\d{2}):(\d{2})/);
             if (mm) gameDur = +mm[1] * 3600 + +mm[2] * 60 + +mm[3];
         });
         const ours = Math.round(item.travel / 1000);
-        if (gameDur !== null && Math.abs(gameDur - ours) > 1) problems.push(`čas pochodu v hre ${fmtDur(gameDur)} ≠ ${fmtDur(ours)}`);
+        if (gameDur !== null && Math.abs(gameDur - ours) > 1) problems.push(L(`travel time in game ${fmtDur(gameDur)} ≠ ${fmtDur(ours)}`, `čas pochodu v hre ${fmtDur(gameDur)} ≠ ${fmtDur(ours)}`));
         if (problems.length) {
-            setBanner(item, `NEPOTVRDZUJ: ${esc(problems.join('; '))}.`, 'err');
+            setBanner(item, L(`DO NOT CONFIRM: ${esc(problems.join('; '))}.`, `NEPOTVRDZUJ: ${esc(problems.join('; '))}.`), 'err');
             return;
         }
-        setBanner(item, `Všetko sedí ✓ · pochod ${fmtDur(ours)} · dopad <b>${fmt(arr)}</b><br>V nádvorí klikni <b>Poslať útok</b>.`, 'ok');
+        setBanner(item, L(`All good ✓ · travel ${fmtDur(ours)} · landing <b>${fmt(arr)}</b><br>Click <b>Send attack</b> in the rally point.`, `Všetko sedí ✓ · pochod ${fmtDur(ours)} · dopad <b>${fmt(arr)}</b><br>V nádvorí klikni <b>Poslať útok</b>.`), 'ok');
     }
 
-    /* ---------------- relácia odosielania ---------------- */
+    /* ---------------- sending session ---------------- */
     function nextReady(exclude) {
         const t = now();
         const reserved = reservedMap();
         state.queue.forEach((q) => evaluate(q, t, reserved));
         return sortedQueue().find((q) => q.status === 'ready' && !exclude.has(q.id));
     }
-    // Uzavrie aktuálny útok: odoslaný → označí; neodoslaný → podľa voľby hráča.
-    // Vráti false, ak má hráč zostať pri aktuálnom útoku.
+    // Closes the current attack: sent → mark it; not sent → as the player chooses.
+    // Returns false if the player wants to stay with the current attack.
     function settleCurrent(askSkip) {
         const item = session.current;
         if (!item || item.status !== 'progress') return true;
         const r = checkSentInFrame(item);
         if (r.found) {
-            markSent(item, r, 'nádvorie');
+            markSent(item, r, L('rally point', 'nádvorie'));
             return true;
         }
         const doc = frameDoc();
         if (doc && doc.querySelector('#troop_confirm_submit, #troop_confirm_go')) {
-            if (askSkip && !confirm(`Útok #${item.no} je na potvrdzovacej stránke a ešte nebol odoslaný.\n\nOK = preskočiť ho (vráti sa do fronty)\nZrušiť = ostať a dokončiť ho`)) return false;
-        } else if (askSkip && !confirm(`Útok #${item.no} (${item.sourceName} → ${item.target}) sa v nádvorí nenašiel ako odoslaný.\n\nOK = preskočiť ho (vráti sa do fronty)\nZrušiť = ostať a odoslať ho`)) {
+            if (askSkip && !confirm(L(`Attack #${item.no} is on the confirmation page and has not been sent yet.\n\nOK = skip it (it goes back to the queue)\nCancel = stay and finish it`,
+                `Útok #${item.no} je na potvrdzovacej stránke a ešte nebol odoslaný.\n\nOK = preskočiť ho (vráti sa do fronty)\nZrušiť = ostať a dokončiť ho`))) return false;
+        } else if (askSkip && !confirm(L(`Attack #${item.no} (${item.sourceName} → ${item.target}) was not found as sent in the rally point.\n\nOK = skip it (it goes back to the queue)\nCancel = stay and send it`,
+            `Útok #${item.no} (${item.sourceName} → ${item.target}) sa v nádvorí nenašiel ako odoslaný.\n\nOK = preskočiť ho (vráti sa do fronty)\nZrušiť = ostať a odoslať ho`))) {
             return false;
         }
         item.status = 'pending';
-        item.reason = 'Preskočený – zostáva vo fronte.';
-        log(item, 'Preskočený (nenašiel sa ako odoslaný)');
+        item.reason = L('Skipped – stays in the queue.', 'Preskočený – zostáva vo fronte.');
+        log(item, L('Skipped (not found as sent)', 'Preskočený (nenašiel sa ako odoslaný)'));
         session.skipped.add(item.id);
         save();
         return true;
     }
-    // ZAČAŤ ODOSIELANIE – otvorí nádvorie a načíta prvý pripravený útok.
+    // START SENDING – opens the rally point and loads the first ready attack.
     function startSession() {
         if (session.running) return;
         const c = counts();
-        if (!c.ready) return alert('Žiadny útok nie je práve pripravený (sú mimo okna odoslania alebo v chybe).');
+        if (!c.ready) return alert(L('No attack is ready right now (outside the send window or in error).', 'Žiadny útok nie je práve pripravený (sú mimo okna odoslania alebo v chybe).'));
         session = { running: true, current: null, skipped: new Set() };
         nextAttack(false);
     }
-    // ĎALŠÍ ÚTOK ▶ – jedno kliknutie: uzavrie aktuálny útok a načíta nádvorie ďalšieho.
+    // NEXT ATTACK ▶ – one click: closes the current attack and loads the rally point of the next one.
     function nextAttack(askSkip = true) {
         if (!session.running) return;
         if (!settleCurrent(askSkip)) return;
@@ -1282,24 +1309,26 @@
             const item = nextReady(session.skipped);
             if (!item) {
                 const left = state.queue.filter((q) => q.status === 'pending').length;
-                endSession(left ? `Teraz nie je pripravený žiadny ďalší útok (${left} čaká na svoje okno).` : 'Hotovo – všetky pripravené útoky sú spracované.');
+                endSession(left
+                    ? L(`No further attack is ready right now (${left} waiting for their window).`, `Teraz nie je pripravený žiadny ďalší útok (${left} čaká na svoje okno).`)
+                    : L('Done – all ready attacks have been processed.', 'Hotovo – všetky pripravené útoky sú spracované.'));
                 return;
             }
             const err = openSend(item);
             if (!err) return;
             session.skipped.add(item.id);
         }
-        endSession('Ďalšie útoky sa nedajú otvoriť.');
+        endSession(L('No further attacks can be opened.', 'Ďalšie útoky sa nedajú otvoriť.'));
     }
-    // Zavrieť nádvorie – ukončí reláciu; odoslaný útok sa ešte označí.
+    // Close – ends the session; a sent attack is still marked.
     function endSession(msg) {
         if (session.current && session.current.status === 'progress') {
             const r = checkSentInFrame(session.current);
-            if (r.found) markSent(session.current, r, 'nádvorie');
+            if (r.found) markSent(session.current, r, L('rally point', 'nádvorie'));
             else {
                 session.current.status = 'pending';
                 session.current.reason = '';
-                log(session.current, 'Nádvorie zatvorené bez odoslania');
+                log(session.current, L('Rally point closed without sending', 'Nádvorie zatvorené bez odoslania'));
             }
             save();
         }
@@ -1311,7 +1340,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Používateľské rozhranie                                            */
+    /*  User interface                                                     */
     /* ------------------------------------------------------------------ */
     let view = 'queue';
     let lastReport = '';
@@ -1332,9 +1361,11 @@
     const CSS = `
 #dk4fm{font:12px/1.45 Verdana,Arial,sans-serif;color:#2b2416;margin:8px 0 14px;border:1px solid #b89a5d;border-radius:8px;background:#f8f0dc;box-shadow:0 2px 8px rgba(0,0,0,.15);overflow:hidden}
 #dk4fm *{box-sizing:border-box}
-#dk4fm .dk-top{display:flex;align-items:center;gap:10px;padding:10px 14px;background:#3d2f1a;color:#f5e6c4}
+#dk4fm .dk-top{display:flex;align-items:center;gap:10px;padding:10px 14px;background:#3d2f1a;color:#f5e6c4;flex-wrap:wrap}
 #dk4fm .dk-top h3{margin:0;font-size:15px;color:#fff;flex:1}
-#dk4fm .dk-mode{padding:4px 10px;border-radius:12px;font-weight:bold;cursor:pointer;border:0}
+#dk4fm .dk-lang{display:inline-flex;border:1px solid #f5e6c4;border-radius:14px;overflow:hidden}
+#dk4fm .dk-lang button{background:transparent;color:#f5e6c4;border:0;padding:4px 12px;font-weight:bold;cursor:pointer;font-size:12px}
+#dk4fm .dk-lang button.on{background:#f5e6c4;color:#3d2f1a}
 #dk4fm .dk-body{padding:12px 14px}
 #dk4fm .dk-grid{display:grid;grid-template-columns:minmax(220px,1.4fr) minmax(260px,1fr) minmax(260px,1fr);gap:12px}
 @media (max-width:900px){#dk4fm .dk-grid{grid-template-columns:1fr}}
@@ -1348,7 +1379,6 @@
 #dk4fm .dk-btn:hover{filter:brightness(1.05)}#dk4fm .dk-btn:disabled{opacity:.45;cursor:not-allowed}
 #dk4fm .dk-btn.pri{background:#2e7d32;border-color:#1b5e20;color:#fff}
 #dk4fm .dk-btn.big{padding:12px 22px;font-size:15px}
-#dk4fm .dk-btn.stop{background:#c62828;border-color:#8e1b1b;color:#fff}
 #dk4fm .dk-btn.sm{padding:2px 7px;font-size:11px;font-weight:normal}
 #dk4fm .dk-btn.send{background:#1565c0;border-color:#0d47a1;color:#fff}
 #dk4fm .dk-btn.x{background:#fff;border-color:#c62828;color:#c62828}
@@ -1383,109 +1413,134 @@
 #dk4fm .dk-help-in code{background:#fff;padding:0 4px;border-radius:3px}
 `;
 
-    // Statická časť (formulár) sa kreslí len raz / pri zmene režimu – aby sa neprepisovalo rozpísané pole.
+    function helpHtml() {
+        if (LANG === 'sk') {
+            return `
+      <ol>
+        <li><b>Vlož cieľové súradnice</b> do poľa 1 (napr. <code>500|500 501|499</code> – oddelené medzerou, čiarkou alebo novým riadkom). Voliteľne nastav, koľko fejkov ide na jeden cieľ.</li>
+        <li><b>Nastav čas dopadu</b> v poli 2:
+          <ul>
+            <li><b>Automatický dátum (odporúčané)</b> – zadáš iba čas „Najskôr“ a „Najneskôr“ (napr. 08:00:01 – 23:59:59). Script sám vyberie najbližší deň, kedy útok stihne dopadnúť, podľa času pochodu – vždy v tvojom okne a mimo nočného bonusu.</li>
+            <li><b>Pevný dátum</b> – vypni Automatický dátum a zadaj konkrétny deň. Ak je dátum príliš blízko (napr. dnes je 18.11., ale baranidlá dopadnú najskôr 22.11.), útok sa nenaplánuje a script napíše, od kedy je dopad možný.</li>
+            <li>Nočný bonus sveta sa vylučuje automaticky. Môžeš pridať aj vlastné zakázané intervaly (napr. <code>12:00-13:00</code>).</li>
+          </ul>
+        </li>
+        <li><b>Vyber typ fejkov</b> v poli 3: automatický mix OFF a DEFF dedín, iba OFF (vždy s baranidlom) alebo iba DEFF (kopijníci/mečiari). Veľkosť fejku sa počíta sama podľa fake limitu sveta (napr. 1 % bodov vysielajúcej dediny).</li>
+        <li>Klikni <b>Overiť a naplánovať</b>. Script overí súradnice, vyberie vhodné dediny a zostaví frontu. Tlačidlo <b>?</b> pri útoku ukáže, prečo bola dedina vybraná a ako sa počítali jednotky.</li>
+        <li>Útok sa dá odoslať, keď má stav <b style="color:#2e7d32">Pripravený</b>. „Čaká na kontrolu“ znamená, že jeho okno sa ešte neotvorilo.</li>
+        <li><b>Odosielanie:</b> klikni <b>ZAČAŤ ODOSIELANIE</b>. Pod panelom sa otvorí nádvorie dediny s prvým útokom, cieľ aj jednotky sú vyplnené. V nádvorí klikni <b>Útok → Poslať útok</b> a potom <b>ĎALŠÍ ÚTOK ▶</b>. Script označí útok ako odoslaný a načíta nádvorie ďalšej dediny z fronty – dediny neprepínaš ručne. Ukončiť môžeš tlačidlom <b>Zavrieť</b>.</li>
+        <li>Ak klikneš na ĎALŠÍ ÚTOK a útok ešte nebol odoslaný, script sa opýta, či ho chceš preskočiť (vráti sa do fronty) alebo ho ešte odoslať.</li>
+        <li>Ak niečo nesedí (málo jednotiek, iný cieľ, dopad mimo okna), pruh nad nádvorím je červený – vtedy útok <b>neodosielaj</b> a klikni ĎALŠÍ ÚTOK. Chybné útoky môžeš <b>Preplánovať</b> alebo <b>ZRUŠIŤ</b> (jednotky sa uvoľnia).</li>
+        <li>Fronta sa ukladá – po obnovení stránky stačí script spustiť znova. Po príchode nových jednotiek klikni <b>↻ Aktualizovať jednotky</b>.</li>
+      </ol>
+      <p class="dk-mut">Zoznam všetkých útokov je schovaný pod <b>📋 Zoznam útokov</b>. V sekcii „Vlastné dediny“ vidíš voľné jednotky každej dediny a môžeš ju ručne prepnúť na OFF/DEFF alebo vylúčiť. V „Pokročilé“ nastavíš rezervu jednotiek, ktoré majú zostať doma.</p>`;
+        }
+        return `
+      <ol>
+        <li><b>Paste target coordinates</b> into box 1 (e.g. <code>500|500 501|499</code> – separated by spaces, commas or new lines). Optionally set how many fakes go to one target.</li>
+        <li><b>Set the landing time</b> in box 2:
+          <ul>
+            <li><b>Automatic date (recommended)</b> – enter only the "Earliest" and "Latest" time (e.g. 08:00:01 – 23:59:59). The script picks the nearest day on which each attack can land, based on its travel time – always inside your window and outside the night bonus.</li>
+            <li><b>Fixed date</b> – turn off Automatic date and enter a day. If the date is too close (e.g. today is 18.11. but rams can land on 22.11. at the earliest), the attack is not planned and the script tells you the earliest possible landing.</li>
+            <li>The world night bonus is excluded automatically. You can add your own forbidden intervals (e.g. <code>12:00-13:00</code>).</li>
+          </ul>
+        </li>
+        <li><b>Choose the fake type</b> in box 3: automatic mix of OFF and DEFF villages, OFF only (always with a ram) or DEFF only (spear fighters/swordsmen). The fake size is calculated from the world fake limit (e.g. 1 % of the sending village's points).</li>
+        <li>Click <b>Check &amp; plan</b>. The script checks the coordinates, chooses suitable villages and builds the queue. The <b>?</b> button shows why a village was chosen and how the units were calculated.</li>
+        <li>An attack can be sent when its status is <b style="color:#2e7d32">Ready</b>. "Waiting" means its send window has not opened yet.</li>
+        <li><b>Sending:</b> click <b>START SENDING</b>. The rally point of the village with the first attack opens below the panel, target and units are filled in. Click <b>Attack → Send attack</b> in the rally point and then <b>NEXT ATTACK ▶</b>. The script marks the attack as sent and loads the rally point of the next village from the queue – no manual village switching. Click <b>Close</b> to stop.</li>
+        <li>If you click NEXT ATTACK and the attack has not been sent, the script asks whether to skip it (it goes back to the queue) or to stay and send it.</li>
+        <li>If something is wrong (not enough units, different target, landing outside the window), the bar above the rally point turns red – <b>do not send</b> the attack and click NEXT ATTACK. Failed attacks can be <b>Re-planned</b> or <b>CANCELLED</b> (units are released).</li>
+        <li>The queue is saved – after a page reload just run the script again. When new units arrive, click <b>↻ Refresh units</b>.</li>
+      </ol>
+      <p class="dk-mut">The full attack list is hidden under <b>📋 Attack list</b>. In "Own villages" you can see the free units of every village and switch it manually to OFF/DEFF or exclude it. In "Advanced" you can set units that must stay at home.</p>`;
+    }
+
+    // Static part (form) – drawn once and on language change, so typed text is not overwritten.
     function renderStatic() {
         const s = S();
         const html = `
 <div class="dk-top">
-  <h3>⚔ DK4 – Správca FAKE útokov <span style="font-weight:normal;font-size:11px">v${VERSION} · ${esc(WORLD)}</span></h3>
-  <span class="dk-mut" style="color:#f5e6c4">Čas sveta: <b id="dk4-clock">${fmt(now())}</b> (${tzLabel()})</span>
-  <button class="dk-btn sm" id="dk4-close" title="Zavrieť panel (fronta zostane uložená)">✕</button>
+  <h3>⚔ DK4 – ${L('Fake Attack Manager', 'Správca FAKE útokov')} <span style="font-weight:normal;font-size:11px">v${VERSION} · ${esc(WORLD)}</span></h3>
+  <span class="dk-mut" style="color:#f5e6c4">${L('World time', 'Čas sveta')}: <b id="dk4-clock">${fmt(now())}</b> (${tzLabel()})</span>
+  <span class="dk-lang" title="${L('Language', 'Jazyk')}"><button data-lang="en" class="${LANG === 'en' ? 'on' : ''}">EN</button><button data-lang="sk" class="${LANG === 'sk' ? 'on' : ''}">SK</button></span>
+  <button class="dk-btn sm" id="dk4-close" title="${L('Close panel (the queue stays saved)', 'Zavrieť panel (fronta zostane uložená)')}">✕</button>
 </div>
 <div class="dk-body">
   <details class="dk-help">
-    <summary>❓ NÁVOD – ako script funguje (klikni pre zobrazenie)</summary>
-    <div class="dk-help-in">
-      <ol>
-        <li><b>Vlož cieľové súradnice</b> do poľa 1 (napr. <code>500|500 501|499</code> – môžu byť oddelené medzerou, čiarkou alebo novým riadkom). Voliteľne nastav, koľko fejkov ide na jeden cieľ.</li>
-        <li><b>Nastav čas dopadu</b> v poli 2:
-          <ul>
-            <li><b>Automatický dátum (odporúčané)</b> – zadáš iba čas „Najskôr“ a „Najneskôr“ (napr. 08:00:01 – 23:59:59). Script sám vyberie najbližší deň, kedy útok stihne dopadnúť, podľa času pochodu. Bližšie dediny dopadnú skôr, vzdialenejšie o deň či dva neskôr – vždy v tvojom okne a mimo nočného bonusu.</li>
-            <li><b>Pevný dátum</b> – vypni Automatický dátum a zadaj konkrétny deň. Pozor: ak je dátum príliš blízko (napr. dnes je 18.11., ale vďaka času pochodu baranidiel sa najskôr dá dopadnúť 22.11.), útok sa nenaplánuje. Script ti napíše, od kedy je dopad možný – nastav neskorší dátum alebo zapni Automatický dátum.</li>
-            <li>Nočný bonus sveta sa vylučuje automaticky. Môžeš pridať aj vlastné zakázané intervaly (napr. <code>12:00-13:00</code>).</li>
-          </ul>
-        </li>
-        <li><b>Vyber typ fejkov</b> v poli 3: automatický mix OFF a DEFF dedín, iba OFF (vždy s baranidlom) alebo iba DEFF (kopijníci/mečiari). Veľkosť fejku sa počíta sama: minimum = 1 % bodov vysielajúcej dediny (fake limit sveta).</li>
-        <li>Klikni <b>Overiť a naplánovať</b>. Script overí súradnice, vyberie vhodné dediny a zostaví frontu. Pri každom útoku tlačidlo <b>?</b> ukáže, prečo bola dedina vybraná a ako sa počítali jednotky.</li>
-        <li>Útok sa dá odoslať, keď má stav <b style="color:#2e7d32">Pripravený</b> (je v okne odoslania). „Čaká na kontrolu“ znamená, že jeho okno sa ešte neotvorilo – v stĺpci Čas odoslania vidíš, o koľko.</li>
-        <li><b>Odosielanie:</b> klikni <b>ZAČAŤ ODOSIELANIE</b>. Pod panelom sa otvorí nádvorie dediny s prvým útokom, cieľ aj jednotky sú vyplnené. V nádvorí klikni <b>Útok → Poslať útok</b> a potom veľké tlačidlo <b>ĎALŠÍ ÚTOK ▶</b>. Script označí útok ako odoslaný a načíta nádvorie ďalšej dediny z fronty – dediny neprepínaš ručne. Takto pokračuj: <b>Útok → Poslať útok → ĎALŠÍ ÚTOK ▶</b>. Ukončiť môžeš tlačidlom <b>Zavrieť</b>.</li>
-        <li>Ak klikneš na ĎALŠÍ ÚTOK a útok ešte nebol odoslaný, script sa opýta, či ho chceš preskočiť (vráti sa do fronty) alebo ho ešte odoslať.</li>
-        <li>Ak niečo nesedí (málo jednotiek, iný cieľ, dopad mimo okna), script to červeno vypíše nad nádvorím – vtedy útok <b>neodosielaj</b> a klikni ĎALŠÍ ÚTOK. Pri nedostatku jednotiek ho označí ako Chyba. Chybné útoky môžeš <b>Preplánovať</b> na inú dedinu alebo <b>ZRUŠIŤ</b> (jednotky sa uvoľnia).</li>
-        <li>Fronta sa ukladá – po obnovení stránky stačí script spustiť znova a pokračuješ, kde si skončil. Po príchode nových jednotiek klikni <b>↻ Aktualizovať jednotky</b>.</li>
-      </ol>
-      <p class="dk-mut">Zoznam všetkých útokov (fronta, odoslané, odstránené) je schovaný pod <b>📋 Zoznam útokov</b> – rozklikni ho, keď ho potrebuješ. Tip: v sekcii „Vlastné dediny a ich klasifikácia“ (úplne dole) vidíš voľné jednotky každej dediny, či je OFF/DEFF a môžeš ju ručne prepnúť alebo vylúčiť. V „Pokročilé“ nastavíš rezervu jednotiek, ktoré majú zostať doma.</p>
-    </div>
+    <summary>❓ ${L('HOW IT WORKS – click to show', 'NÁVOD – ako script funguje (klikni pre zobrazenie)')}</summary>
+    <div class="dk-help-in">${helpHtml()}</div>
   </details>
   <div class="dk-grid">
     <div class="dk-card">
-      <h4>1 · Cieľové súradnice</h4>
+      <h4>1 · ${L('Target coordinates', 'Cieľové súradnice')}</h4>
       <textarea id="dk4-coords" placeholder="500|500 501|499 ...">${esc(s.coords)}</textarea>
       <div class="dk-row">
-        <div><label>Fejkov na cieľ</label><input type="number" id="dk4-per" min="1" max="50" value="${esc(s.perTarget)}"></div>
-        <div><label>&nbsp;</label><label style="margin-top:6px"><input type="checkbox" id="dk4-dup" ${s.allowDup ? 'checked' : ''}> povoliť opakované súradnice</label></div>
+        <div><label>${L('Fakes per target', 'Fejkov na cieľ')}</label><input type="number" id="dk4-per" min="1" max="50" value="${esc(s.perTarget)}"></div>
+        <div><label>&nbsp;</label><label style="margin-top:6px"><input type="checkbox" id="dk4-dup" ${s.allowDup ? 'checked' : ''}> ${L('allow repeated coordinates', 'povoliť opakované súradnice')}</label></div>
       </div>
     </div>
     <div class="dk-card">
-      <h4>2 · Čas dopadu</h4>
-      <label style="font-weight:bold;color:#2e7d32"><input type="checkbox" id="dk4-auto" ${s.autoDate ? 'checked' : ''}> Automatický dátum (najbližší možný deň podľa času pochodu)</label>
+      <h4>2 · ${L('Landing time', 'Čas dopadu')}</h4>
+      <label style="font-weight:bold;color:#2e7d32"><input type="checkbox" id="dk4-auto" ${s.autoDate ? 'checked' : ''}> ${L('Automatic date (nearest possible day by travel time)', 'Automatický dátum (najbližší možný deň podľa času pochodu)')}</label>
       <div class="dk-row">
-        <div><label>Dátum dopadu</label><input type="date" id="dk4-date" value="${esc(s.date)}"></div>
-        <div><label>Hľadať dní dopredu</label><input type="number" id="dk4-autodays" min="1" max="60" value="${esc(s.autoDays)}"></div>
+        <div><label>${L('Landing date', 'Dátum dopadu')}</label><input type="date" id="dk4-date" value="${esc(s.date)}"></div>
+        <div><label>${L('Search days ahead', 'Hľadať dní dopredu')}</label><input type="number" id="dk4-autodays" min="1" max="60" value="${esc(s.autoDays)}"></div>
       </div>
       <div class="dk-row">
-        <div><label>Najskôr</label><input type="time" step="1" id="dk4-from" value="${esc(s.from)}"></div>
-        <div><label>Najneskôr</label><input type="time" step="1" id="dk4-to" value="${esc(s.to)}"></div>
+        <div><label>${L('Earliest', 'Najskôr')}</label><input type="time" step="1" id="dk4-from" value="${esc(s.from)}"></div>
+        <div><label>${L('Latest', 'Najneskôr')}</label><input type="time" step="1" id="dk4-to" value="${esc(s.to)}"></div>
       </div>
-      <label>Zakázané intervaly (denne, napr. 12:00-13:00, 18:00-18:30)</label>
+      <label>${L('Forbidden intervals (daily, e.g. 12:00-13:00, 18:00-18:30)', 'Zakázané intervaly (denne, napr. 12:00-13:00, 18:00-18:30)')}</label>
       <input type="text" id="dk4-forb" value="${esc(s.forbidden)}">
       <div class="dk-mut" style="margin-top:6px">
-        Nočný bonus sveta: ${cfg.night.active ? `<b>${pad(cfg.night.start)}:00 – ${pad(cfg.night.end)}:00</b> (vylúčený automaticky)` : '<b>vypnutý</b>'}<br>
+        ${L('World night bonus', 'Nočný bonus sveta')}: ${cfg.night.active ? `<b>${pad(cfg.night.start)}:00 – ${pad(cfg.night.end)}:00</b> (${L('excluded automatically', 'vylúčený automaticky')})` : `<b>${L('off', 'vypnutý')}</b>`}<br>
         <span id="dk4-arrinfo"></span>
       </div>
     </div>
     <div class="dk-card">
-      <h4>3 · Typ fejkov</h4>
-      <label>Vysielajúce dediny</label>
+      <h4>3 · ${L('Fake type', 'Typ fejkov')}</h4>
+      <label>${L('Sending villages', 'Vysielajúce dediny')}</label>
       <select id="dk4-kind">
-        <option value="mix" ${s.kind === 'mix' ? 'selected' : ''}>OFF aj DEFF (automatický mix)</option>
-        <option value="off" ${s.kind === 'off' ? 'selected' : ''}>Iba OFF fejky (s baranidlom)</option>
-        <option value="deff" ${s.kind === 'deff' ? 'selected' : ''}>Iba DEFF fejky (kopije/mečiari)</option>
+        <option value="mix" ${s.kind === 'mix' ? 'selected' : ''}>${L('OFF and DEFF (automatic mix)', 'OFF aj DEFF (automatický mix)')}</option>
+        <option value="off" ${s.kind === 'off' ? 'selected' : ''}>${L('OFF fakes only (with a ram)', 'Iba OFF fejky (s baranidlom)')}</option>
+        <option value="deff" ${s.kind === 'deff' ? 'selected' : ''}>${L('DEFF fakes only (spears/swords)', 'Iba DEFF fejky (kopije/mečiari)')}</option>
       </select>
-      <div class="dk-mut" style="margin-top:6px"><span id="dk4-flinfo"></span> · Skupina: <b>${GROUP || 'všetky'}</b></div>
-      <details><summary>Pokročilé</summary>
+      <div class="dk-mut" style="margin-top:6px"><span id="dk4-flinfo"></span> · ${L('Group', 'Skupina')}: <b>${GROUP || L('all', 'všetky')}</b></div>
+      <details><summary>${L('Advanced', 'Pokročilé')}</summary>
         <div class="dk-row">
-          <div><label>Poradie OFF doplnenia</label><input type="text" id="dk4-offo" value="${esc(s.offOrder)}"></div>
-          <div><label>Poradie DEFF</label><input type="text" id="dk4-defo" value="${esc(s.deffOrder)}"></div>
+          <div><label>${L('OFF fill order', 'Poradie OFF doplnenia')}</label><input type="text" id="dk4-offo" value="${esc(s.offOrder)}"></div>
+          <div><label>${L('DEFF order', 'Poradie DEFF')}</label><input type="text" id="dk4-defo" value="${esc(s.deffOrder)}"></div>
         </div>
         <div class="dk-row">
-          <div><label>Max. baranidiel / fake</label><input type="number" id="dk4-maxr" min="1" value="${esc(s.maxRams)}"></div>
-          <div><label>Max. útokov / dedina (0 = bez limitu)</label><input type="number" id="dk4-maxv" min="0" value="${esc(s.maxPerVillage)}"></div>
+          <div><label>${L('Max. rams / fake', 'Max. baranidiel / fake')}</label><input type="number" id="dk4-maxr" min="1" value="${esc(s.maxRams)}"></div>
+          <div><label>${L('Max. attacks / village (0 = no limit)', 'Max. útokov / dedina (0 = bez limitu)')}</label><input type="number" id="dk4-maxv" min="0" value="${esc(s.maxPerVillage)}"></div>
         </div>
         <div class="dk-row">
-          <div><label>Rezerva na potvrdenie (s)</label><input type="number" id="dk4-buf" min="0" value="${esc(s.bufferSec)}"></div>
-          <div><label>Fake limit % (prázdne = zo servera)</label><input type="text" id="dk4-fl" value="${esc(s.fakeLimitOverride)}"></div>
+          <div><label>${L('Confirmation buffer (s)', 'Rezerva na potvrdenie (s)')}</label><input type="number" id="dk4-buf" min="0" value="${esc(s.bufferSec)}"></div>
+          <div><label>${L('Fake limit % (empty = from server)', 'Fake limit % (prázdne = zo servera)')}</label><input type="text" id="dk4-fl" value="${esc(s.fakeLimitOverride)}"></div>
         </div>
-        <label>Rezerva jednotiek doma (nepoužije sa)</label>
+        <label>${L('Units to keep at home (never used)', 'Rezerva jednotiek doma (nepoužije sa)')}</label>
         <div class="dk-row" style="flex-wrap:wrap">${SHOWN_UNITS.filter((u) => ALLOWED_UNITS.has(u)).map((u) => `<div style="min-width:70px">${unitIcon(u)}<input type="number" min="0" class="dk4-res" data-u="${u}" value="${esc((s.reserve || {})[u] || 0)}"></div>`).join('')}</div>
       </details>
     </div>
   </div>
   <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-    <button class="dk-btn dk4-busy" id="dk4-validate">Overiť súradnice</button>
-    <button class="dk-btn pri dk4-busy" id="dk4-plan">Overiť a naplánovať</button>
-    <button class="dk-btn dk4-busy" id="dk4-reload">↻ Aktualizovať jednotky</button>
-    <button class="dk-btn dk4-busy" id="dk4-replanall">Preplánovať chybné</button>
-    <button class="dk-btn dk4-busy" id="dk4-clear">Vymazať neodoslané</button>
-    <button class="dk-btn dk4-busy" id="dk4-clearhist">Vymazať históriu</button>
+    <button class="dk-btn dk4-busy" id="dk4-validate">${L('Check coordinates', 'Overiť súradnice')}</button>
+    <button class="dk-btn pri dk4-busy" id="dk4-plan">${L('Check &amp; plan', 'Overiť a naplánovať')}</button>
+    <button class="dk-btn dk4-busy" id="dk4-reload">↻ ${L('Refresh units', 'Aktualizovať jednotky')}</button>
+    <button class="dk-btn dk4-busy" id="dk4-replanall">${L('Re-plan failed', 'Preplánovať chybné')}</button>
+    <button class="dk-btn dk4-busy" id="dk4-clear">${L('Remove unsent', 'Vymazať neodoslané')}</button>
+    <button class="dk-btn dk4-busy" id="dk4-clearhist">${L('Clear history', 'Vymazať históriu')}</button>
     <span class="dk-mut" id="dk4-snap"></span>
   </div>
   <div id="dk4-sendbox" style="display:none;margin-top:12px">
     <div style="display:flex;gap:8px;align-items:stretch;margin-bottom:6px;flex-wrap:wrap">
-      <div id="dk4-sendinfo" style="flex:1;min-width:240px;color:#fff;background:#3d2f1a;padding:8px 12px;border-radius:6px;font-size:12px">Nádvorie</div>
-      <button class="dk-btn big pri" id="dk4-next" style="min-width:190px">ĎALŠÍ ÚTOK ▶</button>
-      <button class="dk-btn x" id="dk4-closeframe">Zavrieť</button>
+      <div id="dk4-sendinfo" style="flex:1;min-width:240px;color:#fff;background:#3d2f1a;padding:8px 12px;border-radius:6px;font-size:12px">${L('Rally point', 'Nádvorie')}</div>
+      <button class="dk-btn big pri" id="dk4-next" style="min-width:190px">${L('NEXT ATTACK ▶', 'ĎALŠÍ ÚTOK ▶')}</button>
+      <button class="dk-btn x" id="dk4-closeframe">${L('Close', 'Zavrieť')}</button>
     </div>
-    <div class="dk-mut" style="margin-bottom:4px">V nádvorí klikni <b>Útok → Poslať útok</b>, potom <b>ĎALŠÍ ÚTOK ▶</b>. Ak je pruh červený, útok neodosielaj.</div>
+    <div class="dk-mut" style="margin-bottom:4px">${L('In the rally point click <b>Attack → Send attack</b>, then <b>NEXT ATTACK ▶</b>. If the bar is red, do not send the attack.', 'V nádvorí klikni <b>Útok → Poslať útok</b>, potom <b>ĎALŠÍ ÚTOK ▶</b>. Ak je pruh červený, útok neodosielaj.')}</div>
     <div class="dk4-framehost"></div>
   </div>
   <div id="dk4-dyn"></div>
@@ -1514,58 +1569,60 @@
         const arr = buildArrival();
         const tb = (k, l) => `<div class="dk-tab ${view === k ? 'on' : ''}" data-view="${k}">${l}</div>`;
         const n = (st) => state.queue.filter((q) => (Array.isArray(st) ? st.includes(q.status) : q.status === st)).length;
+        const nQueue = n(['pending', 'ready', 'progress', 'unverified', 'error']);
 
         box.find('#dk4-date').prop('disabled', !!s.autoDate);
         box.find('#dk4-autodays').prop('disabled', !s.autoDate);
         box.find('#dk4-arrinfo').html(arr.error
             ? `<span class="dk-err">${esc(arr.error)}</span>`
             : s.autoDate
-                ? `Automaticky: každý deň ${esc(s.from)} – ${esc(s.to)} (mimo nočného bonusu), od dnes do ${fmtShort(arr.list[arr.list.length - 1][1]).slice(0, 6)}. Každý útok dopadne v najbližšom možnom dni.`
-                : `Povolené okná dopadu: ${arr.list.map(([a, b]) => `${fmtShort(a)} – ${fmtShort(b)}`).join('; ')}`);
-        box.find('#dk4-flinfo').html(`Fake limit sveta: <b>${fakeLimit()} %</b> bodov vysielajúcej dediny ${s.fakeLimitOverride !== '' ? '(ručne zmenené)' : '(zo servera)'}`);
-        box.find('#dk4-snap').text(`Jednotky načítané ${snapshotAt ? fmtShort(snapshotAt) : '–'} · ${villages.length} dedín`);
+                ? L(`Automatic: every day ${esc(s.from)} – ${esc(s.to)} (outside the night bonus), from today until ${fmtShort(arr.list[arr.list.length - 1][1]).slice(0, 6)}. Every attack lands on the nearest possible day.`,
+                    `Automaticky: každý deň ${esc(s.from)} – ${esc(s.to)} (mimo nočného bonusu), od dnes do ${fmtShort(arr.list[arr.list.length - 1][1]).slice(0, 6)}. Každý útok dopadne v najbližšom možnom dni.`)
+                : L('Allowed landing windows: ', 'Povolené okná dopadu: ') + arr.list.map(([a, b]) => `${fmtShort(a)} – ${fmtShort(b)}`).join('; '));
+        box.find('#dk4-flinfo').html(L(`World fake limit: <b>${fakeLimit()} %</b> of the sending village's points ${s.fakeLimitOverride !== '' ? '(changed manually)' : '(from server)'}`,
+            `Fake limit sveta: <b>${fakeLimit()} %</b> bodov vysielajúcej dediny ${s.fakeLimitOverride !== '' ? '(ručne zmenené)' : '(zo servera)'}`));
+        box.find('#dk4-snap').text(L(`Units loaded ${snapshotAt ? fmtShort(snapshotAt) : '–'} · ${villages.length} villages`, `Jednotky načítané ${snapshotAt ? fmtShort(snapshotAt) : '–'} · ${villages.length} dedín`));
         box.find('.dk4-busy').prop('disabled', busy);
-        const vd = box.find('#dk4-vill');
-        if (vd.length) villagesOpen = vd.prop('open');
+        box.find('.dk-lang button').prop('disabled', busy);
 
         const html = `
   ${lastReport ? `<div class="dk-rep">${lastReport}</div>` : ''}
 
   <div class="dk-prog">
-    <b style="white-space:nowrap">ODOSIELANIE ÚTOKOV</b>
+    <b style="white-space:nowrap">${L('SENDING ATTACKS', 'ODOSIELANIE ÚTOKOV')}</b>
     <div class="dk-bar"><i style="width:${pct}%"></i><span>${c.sent} / ${c.total}</span></div>
-    <span class="dk-stat dk-ok">Odoslané <b>${c.sent}</b></span>
-    <span class="dk-stat">Čakajúce <b>${c.waiting}</b> (pripravené ${c.ready})</span>
-    <span class="dk-stat dk-err">Chybné <b>${c.errors}</b></span>
-    <span class="dk-stat">Zostáva <b>${c.rest}</b></span>
+    <span class="dk-stat dk-ok">${L('Sent', 'Odoslané')} <b>${c.sent}</b></span>
+    <span class="dk-stat">${L('Waiting', 'Čakajúce')} <b>${c.waiting}</b> (${L('ready', 'pripravené')} ${c.ready})</span>
+    <span class="dk-stat dk-err">${L('Errors', 'Chybné')} <b>${c.errors}</b></span>
+    <span class="dk-stat">${L('Remaining', 'Zostáva')} <b>${c.rest}</b></span>
     ${session.running
-        ? `<span class="dk-stat"><b>Odosielanie prebieha</b> – pokračuj v nádvorí nižšie</span>`
-        : `<button class="dk-btn big pri" id="dk4-batch" ${!c.ready ? 'disabled' : ''}>ZAČAŤ ODOSIELANIE (${c.ready})</button>`}
+        ? `<span class="dk-stat"><b>${L('Sending in progress', 'Odosielanie prebieha')}</b> – ${L('continue in the rally point below', 'pokračuj v nádvorí nižšie')}</span>`
+        : `<button class="dk-btn big pri" id="dk4-batch" ${!c.ready ? 'disabled' : ''}>${L('START SENDING', 'ZAČAŤ ODOSIELANIE')} (${c.ready})</button>`}
   </div>
 
-  <details id="dk4-list" ${listOpen ? 'open' : ''}><summary>📋 Zoznam útokov – vo fronte ${n(['pending', 'ready', 'progress', 'unverified', 'error'])}, odoslané ${n('sent')} (klikni pre zobrazenie)</summary>
+  <details id="dk4-list" ${listOpen ? 'open' : ''}><summary>📋 ${L(`Attack list – in queue ${nQueue}, sent ${n('sent')} (click to show)`, `Zoznam útokov – vo fronte ${nQueue}, odoslané ${n('sent')} (klikni pre zobrazenie)`)}</summary>
   ${listOpen ? `<div class="dk-tabs">
-    ${tb('queue', `Fronta (${n(['pending', 'ready', 'progress', 'unverified', 'error'])})`)}
-    ${tb('sent', `Odoslané (${n('sent')})`)}
-    ${tb('removed', `Odstránené (${n('removed')})`)}
-    ${tb('all', `Všetko (${state.queue.length})`)}
+    ${tb('queue', `${L('Queue', 'Fronta')} (${nQueue})`)}
+    ${tb('sent', `${L('Sent', 'Odoslané')} (${n('sent')})`)}
+    ${tb('removed', `${L('Removed', 'Odstránené')} (${n('removed')})`)}
+    ${tb('all', `${L('All', 'Všetko')} (${state.queue.length})`)}
   </div>
   <div class="dk-tw">${renderTable()}</div>` : ''}
   </details>
 
-  <details id="dk4-vill" ${villagesOpen ? 'open' : ''}><summary>Vlastné dediny a ich klasifikácia (${villages.length})</summary>${villagesOpen ? renderVillages() : ''}</details>`;
+  <details id="dk4-vill" ${villagesOpen ? 'open' : ''}><summary>${L('Own villages and their classification', 'Vlastné dediny a ich klasifikácia')} (${villages.length})</summary>${villagesOpen ? renderVillages() : ''}</details>`;
         box.find('#dk4-dyn').html(html);
     }
 
     function renderTable() {
         const t = now();
         const rows = sortedQueue().filter((q) => (view === 'queue' ? ACTIVE.has(q.status) : view === 'all' ? true : q.status === view));
-        if (!rows.length) return `<div style="padding:16px" class="dk-mut">Žiadne útoky v tomto zozname.</div>`;
+        if (!rows.length) return `<div style="padding:16px" class="dk-mut">${L('No attacks in this list.', 'Žiadne útoky v tomto zozname.')}</div>`;
         const busy = session.running;
         return `<table class="dk-t"><thead><tr>
-<th>#</th><th>Cieľ</th><th>Vysielajúca dedina</th><th>Typ</th><th>Zostava</th><th>Čas odoslania</th><th>Čas dopadu</th><th>Stav</th><th>Akcie</th>
+<th>#</th><th>${L('Target', 'Cieľ')}</th><th>${L('Sending village', 'Vysielajúca dedina')}</th><th>${L('Type', 'Typ')}</th><th>${L('Units', 'Zostava')}</th><th>${L('Send time', 'Čas odoslania')}</th><th>${L('Landing time', 'Čas dopadu')}</th><th>${L('Status', 'Stav')}</th><th>${L('Actions', 'Akcie')}</th>
 </tr></thead><tbody>${rows.map((q) => {
-            const st = STATUS[q.status];
+            const stc = STATUS[q.status].c;
             const sw = sendWindows(q.arrival, q.travel, q.buffer, t);
             let sendCell = '';
             let landCell = '';
@@ -1577,44 +1634,46 @@
                 landCell = '–';
             } else if (sw.length) {
                 const open = t >= sw[0][0];
-                sendCell = `${open ? '<b class="dk-ok">teraz</b>' : fmt(sw[0][0])}<br><span class="dk-mut">najneskôr ${fmtShort(sw[sw.length - 1][1])}${open ? '' : ` · o <span class="dk4-cd" data-t="${sw[0][0]}">${fmtDur((sw[0][0] - t) / 1000)}</span>`}</span>`;
-                landCell = `${fmt(Math.max(t, sw[0][0]) + q.travel)}<br><span class="dk-mut">pochod ${fmtDur(q.travel / 1000)} · ${q.dist.toFixed(1)} polí</span>`;
+                sendCell = `${open ? `<b class="dk-ok">${L('now', 'teraz')}</b>` : fmt(sw[0][0])}<br><span class="dk-mut">${L('latest', 'najneskôr')} ${fmtShort(sw[sw.length - 1][1])}${open ? '' : ` · ${L('in', 'o')} <span class="dk4-cd" data-t="${sw[0][0]}">${fmtDur((sw[0][0] - t) / 1000)}</span>`}</span>`;
+                landCell = `${fmt(Math.max(t, sw[0][0]) + q.travel)}<br><span class="dk-mut">${L('travel', 'pochod')} ${fmtDur(q.travel / 1000)} · ${q.dist.toFixed(1)} ${L('fields', 'polí')}</span>`;
             } else {
-                sendCell = '<span class="dk-err">okno uplynulo</span>';
+                sendCell = `<span class="dk-err">${L('window passed', 'okno uplynulo')}</span>`;
                 landCell = '–';
             }
             const tk = q.targetInfo && q.targetInfo.kind;
-            const tkTxt = { barb: 'barbarská', player: 'hráč', own: 'vlastná', unknown: 'neoverené', missing: 'neexistuje' }[tk] || '';
-            const canSend = ['ready'].includes(q.status) && !busy;
+            const tkTxt = {
+                barb: L('barbarian', 'barbarská'), player: L('player', 'hráč'), own: L('own', 'vlastná'),
+                unknown: L('not checked', 'neoverené'), missing: L('does not exist', 'neexistuje'),
+            }[tk] || '';
             let actions = '';
             if (q.status === 'ready' || q.status === 'pending') {
-                actions += `<button class="dk-btn sm send" data-act="send" data-id="${q.id}" ${q.status === 'ready' ? '' : 'disabled'}>OTVORIŤ</button> `;
+                actions += `<button class="dk-btn sm send" data-act="send" data-id="${q.id}" ${q.status === 'ready' ? '' : 'disabled'}>${L('OPEN', 'OTVORIŤ')}</button> `;
             }
             if (q.status === 'unverified') {
-                actions += `<button class="dk-btn sm" data-act="verify" data-id="${q.id}" ${busy ? 'disabled' : ''}>Overiť znova</button> <button class="dk-btn sm" data-act="marksent" data-id="${q.id}" ${busy ? 'disabled' : ''}>Bol odoslaný</button> <button class="dk-btn sm" data-act="back" data-id="${q.id}" ${busy ? 'disabled' : ''}>Nebol odoslaný</button> `;
+                actions += `<button class="dk-btn sm" data-act="verify" data-id="${q.id}" ${busy ? 'disabled' : ''}>${L('Verify', 'Overiť znova')}</button> <button class="dk-btn sm" data-act="marksent" data-id="${q.id}" ${busy ? 'disabled' : ''}>${L('Was sent', 'Bol odoslaný')}</button> <button class="dk-btn sm" data-act="back" data-id="${q.id}" ${busy ? 'disabled' : ''}>${L('Was not sent', 'Nebol odoslaný')}</button> `;
             }
-            if (q.status === 'error') actions += `<button class="dk-btn sm" data-act="replan" data-id="${q.id}" ${busy ? 'disabled' : ''}>Preplánovať</button> <button class="dk-btn sm" data-act="recheck" data-id="${q.id}" ${busy ? 'disabled' : ''}>Skontrolovať</button> `;
-            if (['pending', 'ready', 'error'].includes(q.status)) actions += `<button class="dk-btn sm x" data-act="cancel" data-id="${q.id}" ${monitor && monitor.item.id === q.id ? 'disabled' : ''}>ZRUŠIŤ</button>`;
-            if (q.status === 'progress') actions += '<span class="dk-mut">odošli v nádvorí nižšie</span>';
+            if (q.status === 'error') actions += `<button class="dk-btn sm" data-act="replan" data-id="${q.id}" ${busy ? 'disabled' : ''}>${L('Re-plan', 'Preplánovať')}</button> <button class="dk-btn sm" data-act="recheck" data-id="${q.id}" ${busy ? 'disabled' : ''}>${L('Re-check', 'Skontrolovať')}</button> `;
+            if (['pending', 'ready', 'error'].includes(q.status)) actions += `<button class="dk-btn sm x" data-act="cancel" data-id="${q.id}">${L('CANCEL', 'ZRUŠIŤ')}</button>`;
+            if (q.status === 'progress') actions += `<span class="dk-mut">${L('send it in the rally point below', 'odošli v nádvorí nižšie')}</span>`;
             const why = openWhy.has(q.id)
-                ? `<tr class="st-${q.status}"><td></td><td colspan="8"><div class="dk-why"><b>Prečo tento plán:</b><ul>${q.why.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>${q.log && q.log.length ? `<b>História:</b><ul>${q.log.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<span class="dk-mut">ID: ${esc(q.id)}${q.commandId ? ' · príkaz #' + esc(q.commandId) : ''}</span></div></td></tr>`
+                ? `<tr class="st-${q.status}"><td></td><td colspan="8"><div class="dk-why"><b>${L('Why this plan:', 'Prečo tento plán:')}</b><ul>${q.why.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>${q.log && q.log.length ? `<b>${L('History:', 'História:')}</b><ul>${q.log.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<span class="dk-mut">ID: ${esc(q.id)}${q.commandId ? L(' · command #', ' · príkaz #') + esc(q.commandId) : ''}</span></div></td></tr>`
                 : '';
             return `<tr class="st-${q.status}" data-row="${q.id}">
 <td>${q.no}</td>
 <td><b>${esc(q.target)}</b><br><span class="dk-mut">${esc(tkTxt)}</span></td>
-<td><a href="/game.php?${SITTER}village=${q.sourceId}&screen=overview" target="_blank">${esc(q.sourceName)}</a><br><span class="dk-mut">${fmtNum(q.sourcePoints)} b.</span></td>
+<td><a href="/game.php?${SITTER}village=${q.sourceId}&screen=overview" target="_blank">${esc(q.sourceName)}</a><br><span class="dk-mut">${fmtNum(q.sourcePoints)} ${L('pts', 'b.')}</span></td>
 <td><span class="dk-k ${q.kind}">${q.kind} FAKE</span></td>
-<td>${unitsHtml(q.units)}<br><span class="dk-mut">${esc(variantName(q.units))} · ${q.pop} obyv. (min ${q.minPop})</span></td>
+<td>${unitsHtml(q.units)}<br><span class="dk-mut">${esc(variantName(q.units))} · ${q.pop} ${popWord()} (min ${q.minPop})</span></td>
 <td>${sendCell}</td>
 <td>${landCell}</td>
-<td><span class="dk-st" style="background:${st.c}">${st.t}</span>${q.reason ? `<br><span class="dk-mut" style="color:${st.c}">${esc(q.reason)}</span>` : ''}</td>
-<td>${actions} <button class="dk-btn sm" data-act="why" data-id="${q.id}" title="Prečo bola vybraná táto dedina">?</button></td>
+<td><span class="dk-st" style="background:${stc}">${stLabel(q.status)}</span>${q.reason ? `<br><span class="dk-mut" style="color:${stc}">${esc(q.reason)}</span>` : ''}</td>
+<td>${actions} <button class="dk-btn sm" data-act="why" data-id="${q.id}" title="${L('Why this village was chosen', 'Prečo bola vybraná táto dedina')}">?</button></td>
 </tr>${why}`;
         }).join('')}</tbody></table>`;
     }
 
     function renderVillages() {
-        if (!villages.length) return '<p class="dk-mut">Dediny ešte nie sú načítané.</p>';
+        if (!villages.length) return `<p class="dk-mut">${L('Villages are not loaded yet.', 'Dediny ešte nie sú načítané.')}</p>`;
         const reserved = reservedMap();
         const ov = S().override || {};
         const rows = villages.map((v) => {
@@ -1623,16 +1682,16 @@
             let use = '';
             if (c.type === 'OFF' || c.type === 'DEFF') {
                 const comp = composeFake(v, c.type, av);
-                use = comp.ok ? `<span class="dk-ok">použiteľná – ${esc(unitsText(comp.units))}</span>` : `<span class="dk-err">nepoužiteľná – ${esc(comp.reason)}</span>`;
-            } else use = `<span class="dk-err">nepoužiteľná – ${esc(c.why)}</span>`;
+                use = comp.ok ? `<span class="dk-ok">${L('usable', 'použiteľná')} – ${esc(unitsText(comp.units))}</span>` : `<span class="dk-err">${L('not usable', 'nepoužiteľná')} – ${esc(comp.reason)}</span>`;
+            } else use = `<span class="dk-err">${L('not usable', 'nepoužiteľná')} – ${esc(c.why)}</span>`;
             return `<tr><td>${esc(v.name)}</td><td>${fmtNum(v.points)}</td><td>${v.points ? minPopFor(v) : '–'}</td>
-${SHOWN_UNITS.map((u) => `<td title="doma ${v.troops[u] || 0}">${av[u] || 0}</td>`).join('')}
-<td>${c.type === 'OFF' || c.type === 'DEFF' ? `<span class="dk-k ${c.type}">${c.type}</span>` : c.type === 'SKIP' ? 'vylúčená' : '–'}<br><span class="dk-mut">${esc(c.why)}</span></td>
-<td><select class="dk4-ov" data-id="${v.id}">${['auto', 'off', 'deff', 'skip'].map((o) => `<option value="${o}" ${(ov[v.id] || 'auto') === o ? 'selected' : ''}>${{ auto: 'Auto', off: 'OFF', deff: 'DEFF', skip: 'Vylúčiť' }[o]}</option>`).join('')}</select></td>
+${SHOWN_UNITS.map((u) => `<td title="${L('at home', 'doma')} ${v.troops[u] || 0}">${av[u] || 0}</td>`).join('')}
+<td>${c.type === 'OFF' || c.type === 'DEFF' ? `<span class="dk-k ${c.type}">${c.type}</span>` : c.type === 'SKIP' ? L('excluded', 'vylúčená') : '–'}<br><span class="dk-mut">${esc(c.why)}</span></td>
+<td><select class="dk4-ov" data-id="${v.id}">${['auto', 'off', 'deff', 'skip'].map((o) => `<option value="${o}" ${(ov[v.id] || 'auto') === o ? 'selected' : ''}>${{ auto: 'Auto', off: 'OFF', deff: 'DEFF', skip: L('Exclude', 'Vylúčiť') }[o]}</option>`).join('')}</select></td>
 <td>${use}</td></tr>`;
         });
-        return `<div class="dk-tw"><table class="dk-t"><thead><tr><th>Dedina</th><th>Body</th><th>Min. obyv.</th>${SHOWN_UNITS.map((u) => `<th>${unitIcon(u)}</th>`).join('')}<th>Typ</th><th>Nastavenie</th><th>Fake (voľné jednotky)</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>
-<p class="dk-mut">Čísla jednotiek = voľné (doma − rezerva − rezervované vo fronte). Ťažká jazda sa zobrazuje len na klasifikáciu, do fejkov sa nikdy nepoužije.</p>`;
+        return `<div class="dk-tw"><table class="dk-t"><thead><tr><th>${L('Village', 'Dedina')}</th><th>${L('Points', 'Body')}</th><th>${L('Min. pop.', 'Min. obyv.')}</th>${SHOWN_UNITS.map((u) => `<th>${unitIcon(u)}</th>`).join('')}<th>${L('Type', 'Typ')}</th><th>${L('Setting', 'Nastavenie')}</th><th>${L('Fake (free units)', 'Fake (voľné jednotky)')}</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>
+<p class="dk-mut">${L('Unit numbers = free (at home − reserve − reserved in queue). Heavy cavalry is shown only for classification and is never used in fakes.', 'Čísla jednotiek = voľné (doma − rezerva − rezervované vo fronte). Ťažká jazda sa zobrazuje len na klasifikáciu, do fejkov sa nikdy nepoužije.')}</p>`;
     }
 
     function readSettings(box) {
@@ -1664,11 +1723,12 @@ ${SHOWN_UNITS.map((u) => `<td title="doma ${v.troops[u] || 0}">${av[u] || 0}</td
 
     function reportValidation(v) {
         const st = v.stats;
-        return `<b>Overenie súradníc:</b> zadané ${v.total} · platné ${v.targets.length}${v.dup.length ? ` · opakované ${v.dup.length}${S().allowDup ? ' (ponechané)' : ' (odstránené)'}` : ''}
- · barbarské ${st.barb} · hráčske ${st.player} · vlastné ${st.own} · neexistujú ${st.missing}${st.unknown ? ` · neoverené ${st.unknown}` : ''}
-${v.invalid.length ? `<br><span class="dk-err">Neplatné: ${esc(v.invalid.slice(0, 30).join(', '))}${v.invalid.length > 30 ? '…' : ''}</span>` : ''}
-${v.mapErr ? `<br><span class="dk-err">Mapu sveta sa nepodarilo načítať (${esc(v.mapErr)}) – existencia cieľov nie je overená.</span>` : ''}
-${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ.</span>' : ''}`;
+        const dupTxt = v.dup.length ? L(` · repeated ${v.dup.length}${S().allowDup ? ' (kept)' : ' (removed)'}`, ` · opakované ${v.dup.length}${S().allowDup ? ' (ponechané)' : ' (odstránené)'}`) : '';
+        return `${L('<b>Coordinate check:</b> entered', '<b>Overenie súradníc:</b> zadané')} ${v.total} · ${L('valid', 'platné')} ${v.targets.length}${dupTxt}
+ · ${L('barbarian', 'barbarské')} ${st.barb} · ${L('player', 'hráčske')} ${st.player} · ${L('own', 'vlastné')} ${st.own} · ${L('not existing', 'neexistujú')} ${st.missing}${st.unknown ? ` · ${L('not checked', 'neoverené')} ${st.unknown}` : ''}
+${v.invalid.length ? `<br><span class="dk-err">${L('Invalid', 'Neplatné')}: ${esc(v.invalid.slice(0, 30).join(', '))}${v.invalid.length > 30 ? '…' : ''}</span>` : ''}
+${v.mapErr ? `<br><span class="dk-err">${L(`World map could not be loaded (${esc(v.mapErr)}) – target existence is not checked.`, `Mapu sveta sa nepodarilo načítať (${esc(v.mapErr)}) – existencia cieľov nie je overená.`)}</span>` : ''}
+${st.own ? `<br><span class="dk-err">${L('Own villages are not allowed as targets.', 'Vlastné dediny nie sú povolené ako cieľ.')}</span>` : ''}`;
     }
 
     function bind(box) {
@@ -1689,6 +1749,18 @@ ${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ
             S().coords = box.find('#dk4-coords').val();
             save();
         });
+        box.on('click', '.dk-lang button', function () {
+            if (session.running) return;
+            const l = $(this).data('lang') === 'sk' ? 'sk' : 'en';
+            if (l === LANG) return;
+            readSettings(box);
+            S().lang = l;
+            LANG = l;
+            save();
+            lastReport = '';
+            renderStatic();
+            render();
+        });
         box.on('click', '#dk4-list > summary', (e) => {
             e.preventDefault();
             listOpen = !listOpen;
@@ -1696,8 +1768,7 @@ ${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ
         });
         box.on('click', '#dk4-vill > summary', (e) => {
             e.preventDefault();
-            villagesOpen = !box.find('#dk4-vill').prop('open');
-            box.find('#dk4-vill').prop('open', villagesOpen);
+            villagesOpen = !villagesOpen;
             render();
         });
         box.on('click', '[data-view]', function () {
@@ -1705,13 +1776,13 @@ ${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ
             render();
         });
         box.on('click', '#dk4-close', () => {
-            if (session.running) return alert('Najprv zavri nádvorie (odosielanie).');
-            clearInterval(ticker);
+            if (session.running) return alert(L('Close the rally point (sending) first.', 'Najprv zavri nádvorie (odosielanie).'));
+            clearInterval(window.__dk4fmTicker);
             box.remove();
         });
         box.on('click', '#dk4-validate', async () => {
             readSettings(box);
-            lastReport = 'Overujem súradnice…';
+            lastReport = L('Checking coordinates…', 'Overujem súradnice…');
             render();
             const v = await validateTargets();
             lastReport = reportValidation(v);
@@ -1719,32 +1790,35 @@ ${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ
         });
         box.on('click', '#dk4-plan', async () => {
             readSettings(box);
-            if (!villages.length) return alert('Dediny nie sú načítané.');
-            lastReport = 'Overujem súradnice a plánujem…';
+            if (!villages.length) return alert(L('Villages are not loaded.', 'Dediny nie sú načítané.'));
+            lastReport = L('Checking coordinates and planning…', 'Overujem súradnice a plánujem…');
             render();
             const v = await validateTargets();
             if (!v.targets.length) {
-                lastReport = reportValidation(v) + '<br><span class="dk-err">Žiadne platné súradnice.</span>';
+                lastReport = reportValidation(v) + `<br><span class="dk-err">${L('No valid coordinates.', 'Žiadne platné súradnice.')}</span>`;
                 return render();
             }
             const res = planTargets(v.targets);
             if (res.error) lastReport = reportValidation(v) + `<br><span class="dk-err">${esc(res.error)}</span>`;
             else {
                 const offN = res.created.filter((q) => q.kind === 'OFF').length;
-                lastReport = `${reportValidation(v)}<br><b class="dk-ok">Naplánované: ${res.created.length}</b> (OFF ${offN}, DEFF ${res.created.length - offN})
-${res.removed && res.removed.length ? `<br><span class="dk-mut">Z okna vylúčené: ${esc(res.removed.slice(0, 3).join('; '))}${res.removed.length > 3 ? ` … (+${res.removed.length - 3})` : ''}</span>` : ''}
-${res.timeFails && !S().autoDate ? `<br><b class="dk-err">${res.timeFails} cieľov nestihne dopadnúť v zadanom dátume.</b> Zapni <b>Automatický dátum</b> alebo nastav neskorší dátum dopadu.` : ''}
-${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.length}</span><ul style="margin:2px 0;padding-left:16px">${res.failed.slice(0, 50).map((f) => `<li>${esc(f.t.coord)} – ${esc(f.why)}</li>`).join('')}</ul>` : ''}`;
+                const removedTxt = res.removed && res.removed.length
+                    ? `<br><span class="dk-mut">${L('Excluded from the window', 'Z okna vylúčené')}: ${esc(res.removed.slice(0, 3).join('; '))}${res.removed.length > 3 ? ` … (+${res.removed.length - 3})` : ''}</span>` : '';
+                const timeTxt = res.timeFails && !S().autoDate
+                    ? `<br><b class="dk-err">${L(`${res.timeFails} targets cannot land on the chosen date.`, `${res.timeFails} cieľov nestihne dopadnúť v zadanom dátume.`)}</b> ${L('Turn on <b>Automatic date</b> or choose a later landing date.', 'Zapni <b>Automatický dátum</b> alebo nastav neskorší dátum dopadu.')}` : '';
+                const failTxt = res.failed.length
+                    ? `<br><span class="dk-err">${L('Not planned', 'Nenaplánované')}: ${res.failed.length}</span><ul style="margin:2px 0;padding-left:16px">${res.failed.slice(0, 50).map((f) => `<li>${esc(f.t.coord)} – ${esc(f.why)}</li>`).join('')}</ul>` : '';
+                lastReport = `${reportValidation(v)}<br><b class="dk-ok">${L('Planned', 'Naplánované')}: ${res.created.length}</b> (OFF ${offN}, DEFF ${res.created.length - offN})${removedTxt}${timeTxt}${failTxt}`;
             }
             view = 'queue';
             tick(true);
         });
         box.on('click', '#dk4-reload', async () => {
-            lastReport = 'Načítavam dediny a jednotky…';
+            lastReport = L('Loading villages and units…', 'Načítavam dediny a jednotky…');
             render();
             try {
                 await loadVillages();
-                lastReport = `Jednotky aktualizované (${villages.length} dedín).`;
+                lastReport = L(`Units refreshed (${villages.length} villages).`, `Jednotky aktualizované (${villages.length} dedín).`);
             } catch (e) {
                 lastReport = `<span class="dk-err">${esc(e.message)}</span>`;
             }
@@ -1755,26 +1829,26 @@ ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.le
             if (!errs.length) return;
             let ok = 0;
             errs.forEach((q) => { const r = replan(q); if (r && r.created && r.created.length) ok++; });
-            lastReport = `Preplánované: ${ok} z ${errs.length} chybných útokov.`;
+            lastReport = L(`Re-planned: ${ok} of ${errs.length} failed attacks.`, `Preplánované: ${ok} z ${errs.length} chybných útokov.`);
             tick(true);
         });
         box.on('click', '#dk4-clear', () => {
             const act = state.queue.filter((q) => ['pending', 'ready', 'error'].includes(q.status));
-            if (!act.length || !confirm(`Odstrániť ${act.length} neodoslaných útokov z fronty? Rezervované jednotky sa uvoľnia.`)) return;
-            act.forEach((q) => { q.status = 'removed'; q.reason = 'Hromadne odstránené'; log(q, 'Odstránený'); });
+            if (!act.length || !confirm(L(`Remove ${act.length} unsent attacks from the queue? Reserved units will be released.`, `Odstrániť ${act.length} neodoslaných útokov z fronty? Rezervované jednotky sa uvoľnia.`))) return;
+            act.forEach((q) => { q.status = 'removed'; q.reason = L('Removed in bulk', 'Hromadne odstránené'); log(q, L('Removed', 'Odstránený')); });
             save();
             render();
         });
         box.on('click', '#dk4-clearhist', () => {
             const h = state.queue.filter((q) => q.status === 'sent' || q.status === 'removed');
-            if (!h.length || !confirm(`Vymazať históriu (${h.length} odoslaných/odstránených)?`)) return;
+            if (!h.length || !confirm(L(`Clear history (${h.length} sent/removed)?`, `Vymazať históriu (${h.length} odoslaných/odstránených)?`))) return;
             state.queue = state.queue.filter((q) => !(q.status === 'sent' || q.status === 'removed'));
             save();
             render();
         });
         box.on('click', '#dk4-batch', startSession);
         box.on('click', '#dk4-next', () => nextAttack(true));
-        box.on('click', '#dk4-closeframe', () => endSession('Odosielanie ukončené.'));
+        box.on('click', '#dk4-closeframe', () => endSession(L('Sending finished.', 'Odosielanie ukončené.')));
         box.on('click', '[data-act]', async function () {
             const id = $(this).data('id');
             const item = state.queue.find((q) => q.id === id);
@@ -1789,7 +1863,7 @@ ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.le
                 if (!settleCurrent(true)) return;
                 const err = openSend(item);
                 if (err) {
-                    alert(`Útok #${item.no} sa teraz nedá otvoriť:\n${err}`);
+                    alert(L(`Attack #${item.no} cannot be opened now:\n${err}`, `Útok #${item.no} sa teraz nedá otvoriť:\n${err}`));
                     if (!session.current || session.current.status !== 'progress') endSession();
                 }
                 return;
@@ -1797,14 +1871,16 @@ ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.le
             if (act === 'cancel') {
                 if (!['pending', 'ready', 'error'].includes(item.status)) return;
                 item.status = 'removed';
-                item.reason = 'Zrušený používateľom';
-                log(item, 'Zrušený – jednotky uvoľnené');
+                item.reason = L('Cancelled by user', 'Zrušený používateľom');
+                log(item, L('Cancelled – units released', 'Zrušený – jednotky uvoľnené'));
                 save();
                 return tick(true);
             }
             if (act === 'replan') {
                 const r = replan(item);
-                lastReport = r && r.created && r.created.length ? `Útok na ${item.target} preplánovaný (nový #${r.created[0].no}).` : `<span class="dk-err">Pre ${esc(item.target)} sa nenašla iná vhodná dedina${r && r.failed && r.failed[0] ? ': ' + esc(r.failed[0].why) : ''}.</span>`;
+                lastReport = r && r.created && r.created.length
+                    ? L(`Attack to ${item.target} re-planned (new #${r.created[0].no}).`, `Útok na ${item.target} preplánovaný (nový #${r.created[0].no}).`)
+                    : `<span class="dk-err">${L(`No other suitable village found for ${esc(item.target)}`, `Pre ${esc(item.target)} sa nenašla iná vhodná dedina`)}${r && r.failed && r.failed[0] ? ': ' + esc(r.failed[0].why) : ''}.</span>`;
                 return tick(true);
             }
             if (act === 'recheck') {
@@ -1813,31 +1889,31 @@ ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.le
                 return tick(true);
             }
             if (act === 'verify') {
-                item.reason = 'Overujem…';
+                item.reason = L('Verifying…', 'Overujem…');
                 render();
-                const r = await verifySent(item, 2);
-                if (r.found) markSent(item, r, 'ručné overenie');
-                else item.reason = 'Príkaz sa v prehľade stále nenašiel.';
+                const r = await verifySent(item);
+                if (r.found) markSent(item, r, L('manual check', 'ručné overenie'));
+                else item.reason = L('The command was still not found in the overview.', 'Príkaz sa v prehľade stále nenašiel.');
                 save();
                 return render();
             }
             if (act === 'marksent') {
-                if (!confirm('Naozaj bol útok odoslaný v hre? (Skontroluj v prehľade príkazov.)')) return;
-                markSent(item, null, 'potvrdené používateľom');
+                if (!confirm(L('Was the attack really sent in the game? (Check the commands overview.)', 'Naozaj bol útok odoslaný v hre? (Skontroluj v prehľade príkazov.)'))) return;
+                markSent(item, null, L('confirmed by user', 'potvrdené používateľom'));
                 return render();
             }
             if (act === 'back') {
-                if (!confirm('Útok NEBOL odoslaný – vrátiť ho do fronty?')) return;
+                if (!confirm(L('The attack was NOT sent – put it back into the queue?', 'Útok NEBOL odoslaný – vrátiť ho do fronty?'))) return;
                 item.status = 'pending';
                 item.reason = '';
-                log(item, 'Vrátený do fronty používateľom');
+                log(item, L('Put back into the queue by user', 'Vrátený do fronty používateľom'));
                 save();
                 return tick(true);
             }
         });
     }
 
-    // Tik každú sekundu: hodiny, odpočty, zmeny stavov.
+    // Tick every second: clock, countdowns, status changes (display only).
     let lastSig = '';
     function tick(forceRender) {
         const t = now();
@@ -1855,22 +1931,21 @@ ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.le
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Štart                                                              */
+    /*  Start                                                              */
     /* ------------------------------------------------------------------ */
     $('#dk4fm').remove();
     if (window.__dk4fmTicker) clearInterval(window.__dk4fmTicker);
-    $('#content_value').prepend('<div id="dk4fm-loading" style="padding:10px;background:#f4e4bc;border:1px solid #c6a768;margin:8px 0">DK4: načítavam nastavenia sveta, dediny a jednotky…</div>');
+    $('#content_value').prepend(`<div id="dk4fm-loading" style="padding:10px;background:#f4e4bc;border:1px solid #c6a768;margin:8px 0">${L('DK4: loading world settings, villages and units…', 'DK4: načítavam nastavenia sveta, dediny a jednotky…')}</div>`);
     try {
         await loadWorldConfig(false);
         await loadVillages();
     } catch (e) {
-        $('#dk4fm-loading').html(`<b style="color:#c62828">DK4 chyba:</b> ${esc(e.message)}`);
+        $('#dk4fm-loading').html(`<b style="color:#c62828">${L('DK4 error', 'DK4 chyba')}:</b> ${esc(e.message)}`);
         console.error('DK4', e);
         return;
     }
     $('#dk4fm-loading').remove();
     render();
-    const ticker = setInterval(() => tick(false), 1000);
-    window.__dk4fmTicker = ticker;
+    window.__dk4fmTicker = setInterval(() => tick(false), 1000);
     tick(true);
 })();
