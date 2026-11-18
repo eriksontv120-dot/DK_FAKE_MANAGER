@@ -38,6 +38,7 @@
     const GROUP = game_data.group_id || 0;
     const DAY = 86400000;
     const GAME_UNITS = (game_data.units || []).slice();
+    const IS_MOBILE = $('#mobileHeader').length > 0 || !!window.mobile;
 
     const UNIT_NAME = {
         spear: 'Kopijník', sword: 'Mečiar', axe: 'Sekerník', archer: 'Lukostrelec',
@@ -303,11 +304,44 @@
             const name = (e.find('.quickedit-label').text() || e.text()).trim();
             const m = name.match(/(\d{1,3})\|(\d{1,3})(?!.*\d{1,3}\|\d{1,3})/);
             if (!m) return;
-            let points = pIdx >= 0 ? num(tds.eq(pIdx).text()) : 0;
-            if (!points) points = num(tds.eq(2).text());
-            list.push({ id, name, coord: `${m[1]}|${m[2]}`, x: +m[1], y: +m[2], points, troops: {} });
+            // V mobilnej verzii (appka) má prehľad inú štruktúru – stĺpcom sa tam neverí.
+            let points = 0;
+            if (!IS_MOBILE) {
+                points = pIdx >= 0 ? num(tds.eq(pIdx).text()) : 0;
+                if (!points) points = num(tds.eq(2).text());
+            }
+            list.push({ id, name, coord: `${m[1]}|${m[2]}`, x: +m[1], y: +m[2], points, pointsSrc: points ? 'prehľad produkcie' : '', troops: {} });
         });
         if (!list.length) throw new Error('Nenašli sa žiadne dediny v prehľade produkcie (skontroluj vybranú skupinu).');
+        // Záloha 1: profil hráča (info_player) – aktuálne body, funguje aj v mobilnej appke.
+        if (list.some((v) => !v.points)) {
+            try {
+                const prof = await fetchProfilePoints(list);
+                list.forEach((v) => {
+                    if (!v.points && prof[v.id]) {
+                        v.points = prof[v.id];
+                        v.pointsSrc = 'profil hráča';
+                    }
+                });
+            } catch (e) {
+                console.warn('DK4: body z profilu sa nepodarilo načítať', e);
+            }
+        }
+        // Záloha 2: mapa sveta /map/village.txt (aktualizuje sa raz za hodinu).
+        if (list.some((v) => !v.points)) {
+            try {
+                const map = await loadMap();
+                list.forEach((v) => {
+                    const r = map.get(v.coord);
+                    if (!v.points && r && r.id === v.id && r.points) {
+                        v.points = r.points;
+                        v.pointsSrc = 'mapa sveta (môže byť až 1 h stará)';
+                    }
+                });
+            } catch (e) {
+                console.warn('DK4: body z mapy sa nepodarilo načítať', e);
+            }
+        }
         const troops = await fetchTroops();
         list.forEach((v) => {
             const t = troops.find((r) => String(r.villageId) === v.id);
@@ -317,6 +351,26 @@
         });
         villages = list;
         snapshotAt = now();
+    }
+
+    // Body vlastných dedín zo stránky profilu. Hľadá odkaz na každú dedinu (info_village&id=ID)
+    // a z jej riadku/karty vezme číslo, ktoré nie je súčasťou názvu ani súradníc.
+    async function fetchProfilePoints(list) {
+        const html = await httpGet(gameUrl('info_player', `&id=${PID}`));
+        const doc = $($.parseHTML(html));
+        const out = {};
+        list.forEach((v) => {
+            const a = doc.find(`a[href*="screen=info_village"][href*="id=${v.id}"]`).filter(function () {
+                return new RegExp(`[?&]id=${v.id}(&|$)`).test(this.getAttribute('href') || '');
+            }).first();
+            if (!a.length) return;
+            const box = a.closest('tr').length ? a.closest('tr') : a.parent().parent();
+            let text = box.text().replace(a.text(), ' ');
+            text = text.replace(/\(?\d{1,3}\|\d{1,3}\)?/g, ' ').replace(/K\d{1,2}/g, ' ');
+            const nums = (text.match(/\d{1,3}(?:[.\s ]\d{3})+|\d+/g) || []).map((n) => num(n)).filter((n) => n > 0);
+            if (nums.length) out[v.id] = nums[nums.length - 1];
+        });
+        return out;
     }
 
     // Prevzaté z pôvodného scriptu (fetchTroopsForCurrentGroup) – funkčná časť.
@@ -513,7 +567,7 @@
 
     function composeFake(v, kind, avail) {
         const minPop = minPopFor(v.points);
-        const ex = [`Body dediny ${fmtNum(v.points)} × ${fakeLimit()} % = ${((v.points * fakeLimit()) / 100).toFixed(2)} → minimum ${minPop} obyv.`];
+        const ex = [`Body dediny ${fmtNum(v.points)}${v.pointsSrc ? ` (zdroj: ${v.pointsSrc})` : ''} × ${fakeLimit()} % = ${((v.points * fakeLimit()) / 100).toFixed(2)} → minimum ${minPop} obyv.`];
         if (!v.points) return { ok: false, reason: 'neznáme body dediny', ex };
         let units = null;
         if (kind === 'OFF') {
