@@ -183,6 +183,8 @@
     /* ------------------------------------------------------------------ */
     const DEFAULT_SETTINGS = () => ({
         coords: '',
+        autoDate: true, // dátum dopadu sa určí sám podľa času pochodu
+        autoDays: 14,
         date: isoDate(now() + DAY),
         from: '08:00:01',
         to: '23:59:59',
@@ -471,10 +473,31 @@
     // Vráti povolené intervaly dopadu [[od, do], ...] (uzavreté, presnosť na sekundy).
     function buildArrival() {
         const s = S();
-        const a = wallOf(s.date, s.from);
-        let b = wallOf(s.date, s.to);
-        if (a === null || b === null) return { error: 'Neplatný dátum alebo čas dopadu.' };
-        if (b < a) b += DAY;
+        let list = [];
+        if (s.autoDate) {
+            // Automatický dátum: denné okno od dnes na N dní dopredu – každý útok dopadne v najbližšom možnom dni.
+            const tf = parseTime(s.from);
+            const tt = parseTime(s.to);
+            if (tf === null || tt === null) return { error: 'Neplatný čas dopadu.' };
+            const today = Math.floor(now() / DAY) * DAY;
+            const days = Math.max(1, Math.min(60, num(s.autoDays) || 14));
+            for (let d = 0; d <= days; d++) {
+                const da = today + d * DAY + tf;
+                let db = today + d * DAY + tt;
+                if (db < da) db += DAY;
+                const last = list[list.length - 1];
+                if (last && da <= last[1] + 1000) last[1] = Math.max(last[1], db);
+                else list.push([da, db]);
+            }
+        } else {
+            const a0 = wallOf(s.date, s.from);
+            let b0 = wallOf(s.date, s.to);
+            if (a0 === null || b0 === null) return { error: 'Neplatný dátum alebo čas dopadu.' };
+            if (b0 < a0) b0 += DAY;
+            list = [[a0, b0]];
+        }
+        const a = list[0][0];
+        const b = list[list.length - 1][1];
         const blocks = [];
         if (cfg.night.active && cfg.night.start !== cfg.night.end) {
             blocks.push({ s: cfg.night.start * 3600000, e: cfg.night.end * 3600000, label: `nočný bonus ${pad(cfg.night.start)}:00–${pad(cfg.night.end)}:00` });
@@ -482,7 +505,6 @@
         const fb = parseForbidden(s.forbidden);
         if (fb.bad.length) return { error: 'Neplatný zakázaný interval: ' + fb.bad.join(', ') + ' (formát 12:00-13:30)' };
         blocks.push(...fb.list);
-        let list = [[a, b]];
         const removed = [];
         for (let day = Math.floor(a / DAY) * DAY - DAY; day <= b + DAY; day += DAY) {
             blocks.forEach((bl) => {
@@ -690,6 +712,7 @@
         const created = [];
         const failed = [];
         const per = Math.max(1, Math.min(50, num(s.perTarget) || 1));
+        let timeFails = 0;
 
         targets.forEach((t) => {
             for (let k = 0; k < per; k++) {
@@ -699,6 +722,7 @@
                 }
                 const rej = {};
                 let best = null;
+                let earliest = Infinity;
                 let considered = 0;
                 villages.forEach((v) => {
                     const c = cls[v.id];
@@ -715,7 +739,11 @@
                     if (!comp.ok) { rej[comp.reason.replace(/\(.*\)/, '').trim()] = (rej[comp.reason.replace(/\(.*\)/, '').trim()] || 0) + 1; return; }
                     const travel = Math.round(d * speed(comp.slow) * 60) * 1000;
                     const sw = sendWindows(arr.list, travel, buffer, t0);
-                    if (!sw.length) { rej['nestihne dopadnúť v okne'] = (rej['nestihne dopadnúť v okne'] || 0) + 1; return; }
+                    if (!sw.length) {
+                        rej['nestihne dopadnúť v okne'] = (rej['nestihne dopadnúť v okne'] || 0) + 1;
+                        earliest = Math.min(earliest, t0 + travel);
+                        return;
+                    }
                     const score = [usage[v.id] || 0, d];
                     if (!best || score[0] < best.score[0] || (score[0] === best.score[0] && score[1] < best.score[1])) {
                         best = { v, c, comp, d, travel, sw, score, av };
@@ -723,7 +751,15 @@
                 });
                 if (!best) {
                     const why = Object.entries(rej).map(([r, n]) => `${r}: ${n}×`).join(', ') || (considered ? 'žiadna vhodná dedina' : 'žiadna použiteľná OFF/DEFF dedina');
-                    failed.push({ t, why });
+                    let hint = '';
+                    if (isFinite(earliest)) {
+                        timeFails++;
+                        const tTo = parseTime(s.to) || 0;
+                        const dayStart = Math.floor(earliest / DAY) * DAY;
+                        const sugg = earliest - dayStart > tTo ? dayStart + DAY : dayStart;
+                        hint = ` · najbližšia dedina dopadne najskôr ${fmt(earliest)} → nastav dátum dopadu aspoň ${fmt(sugg).slice(0, 10)} alebo zapni Automatický dátum`;
+                    }
+                    failed.push({ t, why: why + hint });
                     break;
                 }
                 const { v, c, comp, d, travel, sw } = best;
@@ -773,7 +809,7 @@
             }
         });
         save();
-        return { created, failed, removed: arr.removed };
+        return { created, failed, removed: arr.removed, timeFails };
     }
 
     // Preplánovanie chybného útoku – uvoľní jednotky a hľadá inú dedinu.
@@ -1350,6 +1386,12 @@
 #dk4fm .dk-rep{margin-top:8px;padding:8px;border-radius:5px;background:#fff;border:1px dashed #c9b07a;font-size:11px;max-height:200px;overflow:auto}
 #dk4fm .dk-err{color:#c62828}#dk4fm .dk-ok{color:#2e7d32}
 #dk4fm details summary{cursor:pointer;font-weight:bold;margin:6px 0}
+#dk4fm .dk-help{margin:0 0 12px;background:#e8f1fb;border:1px solid #90b4dc;border-radius:6px;padding:4px 12px}
+#dk4fm .dk-help summary{color:#1f5f99;font-size:13px}
+#dk4fm .dk-help-in{padding:0 4px 8px}
+#dk4fm .dk-help-in ol{margin:4px 0;padding-left:20px}
+#dk4fm .dk-help-in li{margin:4px 0}
+#dk4fm .dk-help-in code{background:#fff;padding:0 4px;border-radius:3px}
 `;
 
     // Statická časť (formulár) sa kreslí len raz / pri zmene režimu – aby sa neprepisovalo rozpísané pole.
@@ -1362,6 +1404,28 @@
   <button class="dk-btn sm" id="dk4-close" title="Zavrieť panel (fronta zostane uložená)">✕</button>
 </div>
 <div class="dk-body">
+  <details class="dk-help">
+    <summary>❓ NÁVOD – ako script funguje (klikni pre zobrazenie)</summary>
+    <div class="dk-help-in">
+      <ol>
+        <li><b>Vlož cieľové súradnice</b> do poľa 1 (napr. <code>500|500 501|499</code> – môžu byť oddelené medzerou, čiarkou alebo novým riadkom). Voliteľne nastav, koľko fejkov ide na jeden cieľ.</li>
+        <li><b>Nastav čas dopadu</b> v poli 2:
+          <ul>
+            <li><b>Automatický dátum (odporúčané)</b> – zadáš iba čas „Najskôr“ a „Najneskôr“ (napr. 08:00:01 – 23:59:59). Script sám vyberie najbližší deň, kedy útok stihne dopadnúť, podľa času pochodu. Bližšie dediny dopadnú skôr, vzdialenejšie o deň či dva neskôr – vždy v tvojom okne a mimo nočného bonusu.</li>
+            <li><b>Pevný dátum</b> – vypni Automatický dátum a zadaj konkrétny deň. Pozor: ak je dátum príliš blízko (napr. dnes je 18.11., ale vďaka času pochodu baranidiel sa najskôr dá dopadnúť 22.11.), útok sa nenaplánuje. Script ti napíše, od kedy je dopad možný – nastav neskorší dátum alebo zapni Automatický dátum.</li>
+            <li>Nočný bonus sveta sa vylučuje automaticky. Môžeš pridať aj vlastné zakázané intervaly (napr. <code>12:00-13:00</code>).</li>
+          </ul>
+        </li>
+        <li><b>Vyber typ fejkov</b> v poli 3: automatický mix OFF a DEFF dedín, iba OFF (vždy s baranidlom) alebo iba DEFF (kopijníci/mečiari). Veľkosť fejku sa počíta sama: minimum = 1 % bodov vysielajúcej dediny (fake limit sveta).</li>
+        <li>Klikni <b>Overiť a naplánovať</b>. Script overí súradnice, vyberie vhodné dediny a zostaví frontu. Pri každom útoku tlačidlo <b>?</b> ukáže, prečo bola dedina vybraná a ako sa počítali jednotky.</li>
+        <li>Útok sa dá odoslať, keď má stav <b style="color:#2e7d32">Pripravený</b> (je v okne odoslania). „Čaká na kontrolu“ znamená, že jeho okno sa ešte neotvorilo – v stĺpci Čas odoslania vidíš, o koľko.</li>
+        <li><b>Odosielanie:</b> klikni <b>ODOSLAŤ PRIPRAVENÉ</b> (alebo MANUÁLNE ODOSLAŤ pri jednom útoku). Pod panelom sa otvorí nádvorie s predvyplneným útokom. <b>Drž ENTER</b> (na mobile ťukaj na tlačidlo hry) – Útok → Poslať útok → script overí odoslanie a načíta ďalší cieľ. Kedykoľvek môžeš pustiť Enter alebo kliknúť ZASTAVIŤ.</li>
+        <li>Ak niečo nesedí (málo jednotiek, iný cieľ, dopad mimo okna), script tlačidlo hry <b>zablokuje</b>, útok označí ako Chyba a pokračuje ďalším. Chybné útoky môžeš <b>Preplánovať</b> na inú dedinu alebo <b>ZRUŠIŤ</b> (jednotky sa uvoľnia).</li>
+        <li>Fronta sa ukladá – po obnovení stránky stačí script spustiť znova a pokračuješ, kde si skončil. Po príchode nových jednotiek klikni <b>↻ Aktualizovať jednotky</b>.</li>
+      </ol>
+      <p class="dk-mut">Tip: v sekcii „Vlastné dediny a ich klasifikácia“ (úplne dole) vidíš voľné jednotky každej dediny, či je OFF/DEFF a môžeš ju ručne prepnúť alebo vylúčiť. V „Pokročilé“ nastavíš rezervu jednotiek, ktoré majú zostať doma.</p>
+    </div>
+  </details>
   <div class="dk-grid">
     <div class="dk-card">
       <h4>1 · Cieľové súradnice</h4>
@@ -1373,7 +1437,11 @@
     </div>
     <div class="dk-card">
       <h4>2 · Čas dopadu</h4>
-      <label>Dátum dopadu</label><input type="date" id="dk4-date" value="${esc(s.date)}">
+      <label style="font-weight:bold;color:#2e7d32"><input type="checkbox" id="dk4-auto" ${s.autoDate ? 'checked' : ''}> Automatický dátum (najbližší možný deň podľa času pochodu)</label>
+      <div class="dk-row">
+        <div><label>Dátum dopadu</label><input type="date" id="dk4-date" value="${esc(s.date)}"></div>
+        <div><label>Hľadať dní dopredu</label><input type="number" id="dk4-autodays" min="1" max="60" value="${esc(s.autoDays)}"></div>
+      </div>
       <div class="dk-row">
         <div><label>Najskôr</label><input type="time" step="1" id="dk4-from" value="${esc(s.from)}"></div>
         <div><label>Najneskôr</label><input type="time" step="1" id="dk4-to" value="${esc(s.to)}"></div>
@@ -1456,7 +1524,13 @@
         const tb = (k, l) => `<div class="dk-tab ${view === k ? 'on' : ''}" data-view="${k}">${l}</div>`;
         const n = (st) => state.queue.filter((q) => (Array.isArray(st) ? st.includes(q.status) : q.status === st)).length;
 
-        box.find('#dk4-arrinfo').html(arr.error ? `<span class="dk-err">${esc(arr.error)}</span>` : `Povolené okná dopadu: ${arr.list.map(([a, b]) => `${fmtShort(a)} – ${fmtShort(b)}`).join('; ')}`);
+        box.find('#dk4-date').prop('disabled', !!s.autoDate);
+        box.find('#dk4-autodays').prop('disabled', !s.autoDate);
+        box.find('#dk4-arrinfo').html(arr.error
+            ? `<span class="dk-err">${esc(arr.error)}</span>`
+            : s.autoDate
+                ? `Automaticky: každý deň ${esc(s.from)} – ${esc(s.to)} (mimo nočného bonusu), od dnes do ${fmtShort(arr.list[arr.list.length - 1][1]).slice(0, 6)}. Každý útok dopadne v najbližšom možnom dni.`
+                : `Povolené okná dopadu: ${arr.list.map(([a, b]) => `${fmtShort(a)} – ${fmtShort(b)}`).join('; ')}`);
         box.find('#dk4-flinfo').html(`Fake limit sveta: <b>${fakeLimit()} %</b> bodov vysielajúcej dediny ${s.fakeLimitOverride !== '' ? '(ručne zmenené)' : '(zo servera)'}`);
         box.find('#dk4-snap').text(`Jednotky načítané ${snapshotAt ? fmtShort(snapshotAt) : '–'} · ${villages.length} dedín`);
         box.find('.dk4-busy').prop('disabled', busy);
@@ -1574,6 +1648,8 @@ ${SHOWN_UNITS.map((u) => `<td title="doma ${v.troops[u] || 0}">${av[u] || 0}</td
         s.perTarget = num(box.find('#dk4-per').val()) || 1;
         s.allowDup = box.find('#dk4-dup').is(':checked');
         s.date = box.find('#dk4-date').val();
+        s.autoDate = box.find('#dk4-auto').is(':checked');
+        s.autoDays = Math.max(1, Math.min(60, num(box.find('#dk4-autodays').val()) || 14));
         s.from = box.find('#dk4-from').val();
         s.to = box.find('#dk4-to').val();
         if (/^\d{1,2}:\d{2}$/.test(s.from)) s.from += ':00';
@@ -1614,7 +1690,7 @@ ${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ
                 return;
             }
             readSettings(box);
-            if (/dk4-(date|from|to|forb|fl)/.test(this.id)) render();
+            if (/dk4-(date|from|to|forb|fl|auto|autodays)/.test(this.id)) render();
         });
         box.on('input', '#dk4-coords', () => {
             S().coords = box.find('#dk4-coords').val();
@@ -1658,7 +1734,8 @@ ${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ
             else {
                 const offN = res.created.filter((q) => q.kind === 'OFF').length;
                 lastReport = `${reportValidation(v)}<br><b class="dk-ok">Naplánované: ${res.created.length}</b> (OFF ${offN}, DEFF ${res.created.length - offN})
-${res.removed && res.removed.length ? `<br><span class="dk-mut">Z okna vylúčené: ${esc(res.removed.join('; '))}</span>` : ''}
+${res.removed && res.removed.length ? `<br><span class="dk-mut">Z okna vylúčené: ${esc(res.removed.slice(0, 3).join('; '))}${res.removed.length > 3 ? ` … (+${res.removed.length - 3})` : ''}</span>` : ''}
+${res.timeFails && !S().autoDate ? `<br><b class="dk-err">${res.timeFails} cieľov nestihne dopadnúť v zadanom dátume.</b> Zapni <b>Automatický dátum</b> alebo nastav neskorší dátum dopadu.` : ''}
 ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.length}</span><ul style="margin:2px 0;padding-left:16px">${res.failed.slice(0, 50).map((f) => `<li>${esc(f.t.coord)} – ${esc(f.why)}</li>`).join('')}</ul>` : ''}`;
             }
             view = 'queue';
