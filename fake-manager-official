@@ -14,7 +14,10 @@
  *   - Na "Útok" a "Poslať útok" kliká hráč sám. Script na nádvorí ani na potvrdzovacej stránke
  *     nemení tlačidlá, neposúva na ne kurzor, nič do stránky nevkladá a formulár neodosiela.
  *   - Kontroly (jednotky, cieľ, čas dopadu, čas pochodu) script iba ZOBRAZÍ v paneli mimo stránky hry.
- *   - Po odoslaní script prečíta tabuľku "Vlastné príkazy" a načíta nádvorie ďalšej dediny z fronty.
+ *   - Ďalší útok (nádvorie ďalšej dediny z fronty) sa načíta až po kliknutí hráča na "ĎALŠÍ ÚTOK".
+ *     Pri tomto kliknutí script prečíta tabuľku "Vlastné príkazy" v ráme (bez požiadavky na server)
+ *     a predchádzajúci útok označí ako odoslaný. Jedno kliknutie = jedna akcia; script na nič nereaguje sám.
+ *   - Mapa sveta (/map/village.txt) sa sťahuje najviac raz za hodinu, inak sa číta z IndexedDB.
  *
  * Ďalšie:
  *   - Žiadne požiadavky na stránky tretích strán. Číta len herné stránky a verejné súbory sveta:
@@ -437,10 +440,56 @@
     /* ------------------------------------------------------------------ */
     /*  Mapa sveta (overenie cieľov) – verejný súbor /map/village.txt      */
     /* ------------------------------------------------------------------ */
+    // Mapa sveta sa sťahuje najviac raz za hodinu (pravidlá knižnice) – medzitým sa číta z IndexedDB v prehliadači.
     let mapIndex = null;
+    let mapAt = 0;
+    const MAP_TTL = 3600000;
+    const MAP_DB = `dk4fm_map_${WORLD}`;
+    function idbOpen() {
+        return new Promise((res, rej) => {
+            const r = indexedDB.open(MAP_DB, 1);
+            r.onupgradeneeded = () => r.result.createObjectStore('kv');
+            r.onsuccess = () => res(r.result);
+            r.onerror = () => rej(r.error);
+        });
+    }
+    async function idbGet(key) {
+        const db = await idbOpen();
+        return new Promise((res, rej) => {
+            const q = db.transaction('kv', 'readonly').objectStore('kv').get(key);
+            q.onsuccess = () => { res(q.result); db.close(); };
+            q.onerror = () => { rej(q.error); db.close(); };
+        });
+    }
+    async function idbSet(key, val) {
+        const db = await idbOpen();
+        return new Promise((res, rej) => {
+            const tx = db.transaction('kv', 'readwrite');
+            tx.objectStore('kv').put(val, key);
+            tx.oncomplete = () => { res(); db.close(); };
+            tx.onerror = () => { rej(tx.error); db.close(); };
+        });
+    }
     async function loadMap() {
-        if (mapIndex) return mapIndex;
-        const txt = await httpGet('/map/village.txt', 'text');
+        if (mapIndex && Date.now() - mapAt < MAP_TTL) return mapIndex;
+        let txt = null;
+        let at = 0;
+        try {
+            const c = await idbGet('village');
+            if (c && c.text && Date.now() - c.at < MAP_TTL) {
+                txt = c.text;
+                at = c.at;
+            }
+        } catch (e) { /* IndexedDB nedostupná */ }
+        if (txt === null) {
+            const lastTry = +(localStorage.getItem(MAP_DB + '_at') || 0);
+            if (mapIndex && Date.now() - lastTry < MAP_TTL) return mapIndex;
+            txt = await httpGet('/map/village.txt', 'text');
+            at = Date.now();
+            try { localStorage.setItem(MAP_DB + '_at', String(at)); } catch (e) { /* ignore */ }
+            try { await idbSet('village', { at, text: txt }); } catch (e) { /* ignore */ }
+        }
+        mapAt = at;
         const idx = new Map();
         txt.split('\n').forEach((line) => {
             const p = line.split(',');
@@ -891,7 +940,7 @@
     /*  Odosielanie (vždy s potvrdením hráčom v nádvorí)                 */
     /* ------------------------------------------------------------------ */
     let monitor = null;
-    let batch = { running: false, stop: false };
+    let session = { running: false, current: null, skipped: new Set() };
 
     const placeUrl = (item) => {
         const [x, y] = item.target.split('|');
@@ -965,12 +1014,25 @@
     }
 
     /*
-     * Odosielanie: nádvorie sa načíta do rámu v paneli, predvyplnené cez URL.
-     * Script v nádvorí nič nemení – kontroly len zobrazuje v paneli. Útok odošle hráč (Útok → Poslať útok).
+     * Odosielanie (verzia na schválenie):
+     *  - Nádvorie sa načíta do rámu v paneli, predvyplnené cez URL (x, y, jednotky).
+     *  - Útok odošle hráč v nádvorí sám (Útok → Poslať útok). Script na stránke hry nič nemení.
+     *  - Ďalší útok načíta až kliknutie hráča na "ĎALŠÍ ÚTOK ▶" (jedno kliknutie = jedna akcia).
+     *    Pri tom kliknutí script prečíta tabuľku "Vlastné príkazy" v ráme (bez požiadavky na server)
+     *    a predchádzajúci útok označí ako odoslaný.
+     *  - Script na nič nereaguje sám a bez kliknutia neposiela žiadne požiadavky.
      */
     function sendWin() {
         const f = document.getElementById('dk4-frame');
         return f && f.contentWindow ? f.contentWindow : null;
+    }
+    function frameDoc() {
+        try {
+            const w = sendWin();
+            return w && w.document && w.document.readyState === 'complete' ? w.document : null;
+        } catch (e) {
+            return null;
+        }
     }
     function showFrame(on) {
         const box = $('#dk4-sendbox');
@@ -988,9 +1050,9 @@
         const col = level === 'ok' ? '#2e7d32' : level === 'warn' ? '#b26a00' : level === 'err' ? '#c62828' : '#3d2f1a';
         $('#dk4-sendinfo').html(html).css({ background: col });
     }
-    // Vlastné útoky danej dediny na cieľ – z tabuľky "Vlastné príkazy" na nádvorí (bez ďalšej požiadavky).
+    // Vlastné útoky danej dediny na cieľ – z tabuľky "Vlastné príkazy" na nádvorí.
     function outgoingMatches(doc, item) {
-        const table = doc.getElementById('commands_outgoings');
+        const table = doc && doc.getElementById('commands_outgoings');
         if (!table) return { table: false, ids: [] };
         const re = coordRe(item.target);
         const ids = [];
@@ -1002,89 +1064,59 @@
         });
         return { table: true, ids };
     }
+    // Bol útok odoslaný? Číta len stránku, ktorá je práve v ráme.
+    function checkSentInFrame(item) {
+        const doc = frameDoc();
+        if (!doc) return { found: false };
+        let href = '';
+        try { href = sendWin().location.href; } catch (e) { /* ignore */ }
+        if (!new RegExp(`[?&]village=${item.sourceId}(&|$)`).test(href)) return { found: false };
+        const local = outgoingMatches(doc, item);
+        const claimed = claimedIds();
+        const before = item.before || [];
+        const fresh = local.ids.filter((id) => !claimed.has(id) && !before.includes(id));
+        return fresh.length ? { found: true, cmd: { cmdId: fresh[0] }, extra: fresh.length - 1 } : { found: false };
+    }
 
-    async function openSend(item, inBatch) {
-        if (monitor) {
-            if (!inBatch) alert('Práve prebieha odosielanie iného útoku.');
-            return false;
-        }
-        if (item.status === 'sent' || item.status === 'progress') return false;
+    // Načíta nádvorie pre útok do rámu (jedna akcia).
+    function openSend(item) {
+        if (item.status === 'sent' || item.status === 'progress') return 'Útok je už odoslaný alebo otvorený.';
         const err = precheck(item);
         if (err) {
             render();
-            if (!inBatch) alert(`Útok #${item.no} nie je možné odoslať:\n${err}`);
-            return false;
+            return err;
         }
         showFrame(true);
         const win = sendWin();
-        if (!win) {
-            alert('Nádvorie sa nepodarilo načítať do panelu.');
-            return false;
-        }
+        if (!win) return 'Nádvorie sa nepodarilo načítať do panelu.';
         item.status = 'progress';
         item.reason = '';
-        item.before = item.before || null;
         log(item, 'Načítané nádvorie (Útok → Poslať útok)');
         save();
-        render();
+        stopMonitor();
         startMonitor(item, win);
+        session.current = item;
         sendInfo(`Načítavam nádvorie: útok #${item.no} · ${esc(item.sourceName)} → <b>${esc(item.target)}</b>…`);
-        try {
-            win.location.href = placeUrl(item);
-        } catch (e) {
-            stopMonitor();
-            item.status = 'pending';
-            save();
-            render();
-            return false;
-        }
-        return true;
+        win.location.href = placeUrl(item);
+        render();
+        return '';
     }
 
+    // Monitor len ZOBRAZUJE kontroly v paneli (nič nemení, nič neodosiela, na nič nereaguje).
     function startMonitor(item, win) {
         let initialDoc = null;
         try { initialDoc = win.document; } catch (e) { /* ignore */ }
-        // initialDoc = stránka, ktorá bola v ráme pred načítaním (predchádzajúci útok) – ignoruje sa.
-        monitor = { item, initialDoc, doc: null, confirmSeen: false, onConfirm: false, busy: false, prepared: false };
-        monitor.timer = setInterval(() => tickMonitor(monitor), 300);
+        monitor = { item, initialDoc, doc: null, prepared: false };
+        monitor.timer = setInterval(() => tickMonitor(monitor), 400);
     }
     function stopMonitor() {
         if (monitor) clearInterval(monitor.timer);
         monitor = null;
     }
-    function closeFrame() {
-        // spracovanie ako "zatvorené okno" urobí monitor
-        showFrame(false);
-        if (!monitor && batch.running) endBatch('Nádvorie zatvorené – dávka zastavená.');
-    }
-
-    async function tickMonitor(m) {
-        if (m.busy || monitor !== m) return;
-        const item = m.item;
+    function tickMonitor(m) {
+        if (monitor !== m) return;
         const win = sendWin();
-        if (!win) {
-            m.busy = true;
-            stopMonitor();
-            if (m.confirmSeen) {
-                item.reason = 'Overujem…';
-                render();
-                const r = await verifySent(item, 3);
-                if (r.found) markSent(item, r, 'po zatvorení nádvoria');
-                else {
-                    item.status = 'unverified';
-                    item.reason = 'Nádvorie bolo zatvorené po potvrdzovacej obrazovke, ale príkaz sa nenašiel. Over ručne.';
-                    log(item, item.reason);
-                }
-            } else {
-                item.status = 'pending';
-                item.reason = '';
-                log(item, 'Nádvorie zatvorené bez odoslania – vrátené do fronty');
-            }
-            if (batch.running) endBatch('Nádvorie zatvorené – dávka zastavená.');
-            save();
-            render();
-            return;
-        }
+        if (!win) return stopMonitor();
         let doc, href;
         try {
             doc = win.document;
@@ -1093,8 +1125,7 @@
             return;
         }
         if (!doc || doc === m.initialDoc || doc.readyState !== 'complete' || !/screen=/.test(href)) return;
-        const newDoc = doc !== m.doc;
-        if (newDoc) {
+        if (doc !== m.doc) {
             m.doc = doc;
             m.prepared = false;
             try {
@@ -1102,75 +1133,33 @@
                 if (cv) win.scrollTo(0, Math.max(0, cv.getBoundingClientRect().top + win.scrollY - 8));
             } catch (e) { /* ignore */ }
         }
+        const item = m.item;
         const isForm = !!doc.querySelector('#target_attack');
         const isConfirm = !!doc.querySelector('#troop_confirm_submit, #troop_confirm_go') || (/try=confirm/.test(href) && !isForm);
-
-        if (isConfirm) {
-            m.confirmSeen = true;
-            m.onConfirm = true;
-            confirmStage(doc, win, m);
-            return;
-        }
-        if (m.onConfirm) {
-            // potvrdzovacia obrazovka zmizla → overiť, či vznikol príkaz
-            m.onConfirm = false;
-            m.busy = true;
-            let r = { found: false };
-            const local = outgoingMatches(doc, item);
-            const claimed = claimedIds();
-            const before = item.before || [];
-            const fresh = local.ids.filter((id) => !claimed.has(id) && !before.includes(id));
-            if (fresh.length) r = { found: true, cmd: { cmdId: fresh[0] }, extra: fresh.length - 1 };
-            else if (!local.table || item.before === null) r = await verifySent(item, 3);
-            m.busy = false;
-            if (monitor !== m) return;
-            if (r.found) {
-                stopMonitor();
-                markSent(item, r, local.ids.length ? 'nádvorie' : 'prehľad príkazov');
-                render();
-                if (batch.running && !batch.stop) nextInBatch();
-                else {
-                    if (batch.running) endBatch('Dávka zastavená používateľom.');
-                    showFrame(false);
-                }
-                return;
-            }
-            const eb = doc.querySelector('.error_box');
-            const msg = eb ? eb.textContent.replace(/\s+/g, ' ').trim() : 'Príkaz sa po potvrdení nenašiel.';
-            stopMonitor();
-            item.status = eb ? 'error' : 'unverified';
-            item.reason = 'Hra: ' + msg;
-            log(item, 'Po potvrdení: ' + msg);
-            save();
-            render();
-            sendInfo(`Útok #${item.no}: ${esc(msg)}`, 'err');
-            if (batch.running && !batch.stop) setTimeout(nextInBatch, 800);
-            else if (batch.running) endBatch('Dávka zastavená.');
-            return;
-        }
-        if (isForm) {
-            // formulár musí patriť vysielajúcej dedine tohto útoku
-            if (!new RegExp(`[?&]village=${item.sourceId}(&|$)`).test(href)) return;
-            formStage(doc, win, m);
-        }
+        if (isConfirm) return confirmStage(doc, m);
+        if (isForm && new RegExp(`[?&]village=${item.sourceId}(&|$)`).test(href)) formStage(doc, m);
     }
 
     // Stav útoku sa zobrazuje iba v paneli scriptu (mimo stránky hry).
-    function setBanner(doc, item, html, level) {
-        const inner = `<b>DK4 útok #${item.no}</b> · ${esc(item.kind)} FAKE · ${esc(item.sourceName)} → <b>${esc(item.target)}</b> · ${esc(unitsText(item.units))} (${item.pop}/${item.minPop} obyv.)<br>${html}`;
+    function setBanner(item, html, level) {
+        const inner = `<b>Útok #${item.no}</b> · ${esc(item.kind)} FAKE · ${esc(item.sourceName)} → <b>${esc(item.target)}</b> · ${esc(unitsText(item.units))} (${item.pop}/${item.minPop} obyv.)<br>${html}`;
         if ($('#dk4-sendinfo').html() !== inner) sendInfo(inner, level);
     }
 
-    function formStage(doc, win, m) {
+    function formStage(doc, m) {
         const item = m.item;
-        const btn = doc.getElementById('target_attack');
+        // Ak sa útok už objavil vo "Vlastných príkazoch", hráč ho odoslal – len to oznámime.
+        if (item.before && checkSentInFrame(item).found) {
+            setBanner(item, 'Útok bol odoslaný ✓ · Klikni <b>ĎALŠÍ ÚTOK ▶</b>.', 'ok');
+            return;
+        }
         if (!m.prepared) {
             m.prepared = true;
             // stav "pred odoslaním" – vlastné príkazy z tejto dediny na cieľ
             const local = outgoingMatches(doc, item);
             item.before = Array.from(new Set([...(item.before || []), ...local.ids]));
             save();
-            // predvyplnenie (URL to už spravila; toto len opraví rozdiely)
+            // predvyplnenie (URL to už spravila; toto len opraví rozdiely – rovnako ako iné fake scripty)
             GAME_UNITS.forEach((u) => {
                 const inp = doc.getElementById('unit_input_' + u);
                 if (!inp) return;
@@ -1194,25 +1183,24 @@
                 item.status = 'error';
                 item.reason = lacking.length ? 'Na nádvorí nie je dosť jednotiek: ' + lacking.join(', ') : 'Cieľ sa nepredvyplnil správne.';
                 log(item, item.reason);
-                setBanner(doc, item, `NEODOSIELAJ – ${esc(item.reason)}`, 'err');
-                stopMonitor();
+                m.failed = item.reason;
                 save();
                 render();
-                if (batch.running && !batch.stop) setTimeout(nextInBatch, 800);
-                else if (batch.running) endBatch('Dávka zastavená.');
-                return;
             }
         }
+        if (m.failed) {
+            setBanner(item, `NEODOSIELAJ – ${esc(m.failed)}<br>Klikni <b>ĎALŠÍ ÚTOK ▶</b> pre ďalší útok.`, 'err');
+            return;
+        }
         const arr = now() + item.travel;
-        const ok = inArrival(item.arrival, arr, 0);
-        if (ok) {
-            setBanner(doc, item, `Jednotky a cieľ skontrolované ✓ · Dopad pri odoslaní teraz: <b>${fmt(arr)}</b> ✓<br>Klikni v nádvorí na <b>Útok</b>.`, 'ok');
+        if (inArrival(item.arrival, arr, 0)) {
+            setBanner(item, `Skontrolované ✓ · dopad pri odoslaní teraz: <b>${fmt(arr)}</b><br>V nádvorí klikni <b>Útok</b>.`, 'ok');
         } else {
-            setBanner(doc, item, `NEODOSIELAJ: pri odoslaní teraz by útok dopadol <b>${fmt(arr)}</b> – mimo povoleného okna.`, 'err');
+            setBanner(item, `NEODOSIELAJ: útok by teraz dopadol <b>${fmt(arr)}</b> – mimo povoleného okna.`, 'err');
         }
     }
 
-    function confirmStage(doc, win, m) {
+    function confirmStage(doc, m) {
         const item = m.item;
         const btn = doc.querySelector('#troop_confirm_submit, #troop_confirm_go');
         const form = (btn && btn.form) || doc.getElementById('command-data-form') || doc.body;
@@ -1221,7 +1209,6 @@
             return el ? String(el.value) : null;
         };
         const problems = [];
-        // presná zhoda s plánom: dedina, cieľ, jednotky
         const [x, y] = item.target.split('|');
         if (val('source_village') !== null && val('source_village') !== String(item.sourceId)) problems.push('iná vysielajúca dedina');
         if (val('x') !== null && (val('x') !== x || val('y') !== y)) problems.push('iný cieľ');
@@ -1232,8 +1219,7 @@
             if ((+v || 0) !== (item.units[u] || 0)) problems.push(`${UNIT_NAME[u] || u}: ${v} namiesto ${item.units[u] || 0}`);
         });
         const arr = now() + item.travel;
-        const ok = inArrival(item.arrival, arr, 0);
-        if (!ok) problems.push(`dopad ${fmt(arr)} je mimo povoleného okna`);
+        if (!inArrival(item.arrival, arr, 0)) problems.push(`dopad ${fmt(arr)} je mimo povoleného okna`);
         let gameDur = null;
         form.querySelectorAll('tr').forEach((tr) => {
             const cells = tr.querySelectorAll('td');
@@ -1244,41 +1230,84 @@
         const ours = Math.round(item.travel / 1000);
         if (gameDur !== null && Math.abs(gameDur - ours) > 1) problems.push(`čas pochodu v hre ${fmtDur(gameDur)} ≠ ${fmtDur(ours)}`);
         if (problems.length) {
-            setBanner(doc, item, `NEPOTVRDZUJ: ${esc(problems.join('; '))}. Zavri nádvorie alebo zastav dávku.`, 'err');
+            setBanner(item, `NEPOTVRDZUJ: ${esc(problems.join('; '))}.`, 'err');
             return;
         }
-        setBanner(doc, item, `Všetko sedí ✓ · cieľ ${esc(item.target)} · pochod ${fmtDur(ours)} · dopad <b>${fmt(arr)}</b><br>Klikni v nádvorí na <b>Poslať útok</b>.`, 'ok');
+        setBanner(item, `Všetko sedí ✓ · pochod ${fmtDur(ours)} · dopad <b>${fmt(arr)}</b><br>V nádvorí klikni <b>Poslať útok</b>.`, 'ok');
     }
 
-    // ODOSLAŤ PRIPRAVENÉ – cieľ po cieli; každý útok odošle hráč v nádvorí sám (Útok → Poslať útok).
-    function startBatch() {
-        if (batch.running || monitor) return;
-        const c = counts();
-        if (!c.ready) return alert('Žiadny útok nie je práve pripravený (sú mimo okna odoslania alebo v chybe).');
-        if (!confirm(`Spustiť odosielanie ${c.ready} pripravených útokov?\n\nNádvorie sa otvorí v paneli predvyplnené. Útok odošleš v hre (Útok → Poslať útok), po overení sa načíta ďalší cieľ.\nZastaviť môžeš tlačidlom ZASTAVIŤ.`)) return;
-        batch = { running: true, stop: false };
-        render();
-        nextInBatch();
-    }
-    function nextReady() {
+    /* ---------------- relácia odosielania ---------------- */
+    function nextReady(exclude) {
         const t = now();
         const reserved = reservedMap();
         state.queue.forEach((q) => evaluate(q, t, reserved));
-        return sortedQueue().find((q) => q.status === 'ready');
+        return sortedQueue().find((q) => q.status === 'ready' && !exclude.has(q.id));
     }
-    async function nextInBatch() {
-        if (!batch.running) return;
-        if (batch.stop) return endBatch('Dávka zastavená používateľom.');
-        const item = nextReady();
-        if (!item) return endBatch('Hotovo – žiadny ďalší pripravený útok.');
-        const ok = await openSend(item, true);
-        if (ok === false) setTimeout(nextInBatch, 300);
+    // Uzavrie aktuálny útok: odoslaný → označí; neodoslaný → podľa voľby hráča.
+    // Vráti false, ak má hráč zostať pri aktuálnom útoku.
+    function settleCurrent(askSkip) {
+        const item = session.current;
+        if (!item || item.status !== 'progress') return true;
+        const r = checkSentInFrame(item);
+        if (r.found) {
+            markSent(item, r, 'nádvorie');
+            return true;
+        }
+        const doc = frameDoc();
+        if (doc && doc.querySelector('#troop_confirm_submit, #troop_confirm_go')) {
+            if (askSkip && !confirm(`Útok #${item.no} je na potvrdzovacej stránke a ešte nebol odoslaný.\n\nOK = preskočiť ho (vráti sa do fronty)\nZrušiť = ostať a dokončiť ho`)) return false;
+        } else if (askSkip && !confirm(`Útok #${item.no} (${item.sourceName} → ${item.target}) sa v nádvorí nenašiel ako odoslaný.\n\nOK = preskočiť ho (vráti sa do fronty)\nZrušiť = ostať a odoslať ho`)) {
+            return false;
+        }
+        item.status = 'pending';
+        item.reason = 'Preskočený – zostáva vo fronte.';
+        log(item, 'Preskočený (nenašiel sa ako odoslaný)');
+        session.skipped.add(item.id);
+        save();
+        return true;
     }
-    function endBatch(msg) {
-        batch = { running: false, stop: false };
-        if (!monitor) showFrame(false);
+    // ZAČAŤ ODOSIELANIE – otvorí nádvorie a načíta prvý pripravený útok.
+    function startSession() {
+        if (session.running) return;
+        const c = counts();
+        if (!c.ready) return alert('Žiadny útok nie je práve pripravený (sú mimo okna odoslania alebo v chybe).');
+        session = { running: true, current: null, skipped: new Set() };
+        nextAttack(false);
+    }
+    // ĎALŠÍ ÚTOK ▶ – jedno kliknutie: uzavrie aktuálny útok a načíta nádvorie ďalšieho.
+    function nextAttack(askSkip = true) {
+        if (!session.running) return;
+        if (!settleCurrent(askSkip)) return;
+        for (let guard = 0; guard < 50; guard++) {
+            const item = nextReady(session.skipped);
+            if (!item) {
+                const left = state.queue.filter((q) => q.status === 'pending').length;
+                endSession(left ? `Teraz nie je pripravený žiadny ďalší útok (${left} čaká na svoje okno).` : 'Hotovo – všetky pripravené útoky sú spracované.');
+                return;
+            }
+            const err = openSend(item);
+            if (!err) return;
+            session.skipped.add(item.id);
+        }
+        endSession('Ďalšie útoky sa nedajú otvoriť.');
+    }
+    // Zavrieť nádvorie – ukončí reláciu; odoslaný útok sa ešte označí.
+    function endSession(msg) {
+        if (session.current && session.current.status === 'progress') {
+            const r = checkSentInFrame(session.current);
+            if (r.found) markSent(session.current, r, 'nádvorie');
+            else {
+                session.current.status = 'pending';
+                session.current.reason = '';
+                log(session.current, 'Nádvorie zatvorené bez odoslania');
+            }
+            save();
+        }
+        stopMonitor();
+        showFrame(false);
+        session = { running: false, current: null, skipped: new Set() };
         if (msg && window.UI && UI.InfoMessage) UI.InfoMessage(msg);
-        render();
+        tick(true);
     }
 
     /* ------------------------------------------------------------------ */
@@ -1287,6 +1316,7 @@
     let view = 'queue';
     let lastReport = '';
     let villagesOpen = false;
+    let listOpen = false;
     const openWhy = new Set();
 
     function sortedQueue() {
@@ -1378,11 +1408,12 @@
         <li><b>Vyber typ fejkov</b> v poli 3: automatický mix OFF a DEFF dedín, iba OFF (vždy s baranidlom) alebo iba DEFF (kopijníci/mečiari). Veľkosť fejku sa počíta sama: minimum = 1 % bodov vysielajúcej dediny (fake limit sveta).</li>
         <li>Klikni <b>Overiť a naplánovať</b>. Script overí súradnice, vyberie vhodné dediny a zostaví frontu. Pri každom útoku tlačidlo <b>?</b> ukáže, prečo bola dedina vybraná a ako sa počítali jednotky.</li>
         <li>Útok sa dá odoslať, keď má stav <b style="color:#2e7d32">Pripravený</b> (je v okne odoslania). „Čaká na kontrolu“ znamená, že jeho okno sa ešte neotvorilo – v stĺpci Čas odoslania vidíš, o koľko.</li>
-        <li><b>Odosielanie:</b> klikni <b>ODOSLAŤ PRIPRAVENÉ</b> (alebo MANUÁLNE ODOSLAŤ pri jednom útoku). Pod panelom sa otvorí nádvorie s predvyplneným útokom. Klikni <b>Útok → Poslať útok</b> – script overí odoslanie a sám načíta nádvorie ďalšej dediny. Kedykoľvek môžeš kliknúť ZASTAVIŤ.</li>
-        <li>Ak niečo nesedí (málo jednotiek, iný cieľ, dopad mimo okna), script to červeno vypíše nad nádvorím – vtedy útok <b>neodosielaj</b>. Pri nedostatku jednotiek ho označí ako Chyba a pokračuje ďalším. Chybné útoky môžeš <b>Preplánovať</b> na inú dedinu alebo <b>ZRUŠIŤ</b> (jednotky sa uvoľnia).</li>
+        <li><b>Odosielanie:</b> klikni <b>ZAČAŤ ODOSIELANIE</b>. Pod panelom sa otvorí nádvorie dediny s prvým útokom, cieľ aj jednotky sú vyplnené. V nádvorí klikni <b>Útok → Poslať útok</b> a potom veľké tlačidlo <b>ĎALŠÍ ÚTOK ▶</b>. Script označí útok ako odoslaný a načíta nádvorie ďalšej dediny z fronty – dediny neprepínaš ručne. Takto pokračuj: <b>Útok → Poslať útok → ĎALŠÍ ÚTOK ▶</b>. Ukončiť môžeš tlačidlom <b>Zavrieť</b>.</li>
+        <li>Ak klikneš na ĎALŠÍ ÚTOK a útok ešte nebol odoslaný, script sa opýta, či ho chceš preskočiť (vráti sa do fronty) alebo ho ešte odoslať.</li>
+        <li>Ak niečo nesedí (málo jednotiek, iný cieľ, dopad mimo okna), script to červeno vypíše nad nádvorím – vtedy útok <b>neodosielaj</b> a klikni ĎALŠÍ ÚTOK. Pri nedostatku jednotiek ho označí ako Chyba. Chybné útoky môžeš <b>Preplánovať</b> na inú dedinu alebo <b>ZRUŠIŤ</b> (jednotky sa uvoľnia).</li>
         <li>Fronta sa ukladá – po obnovení stránky stačí script spustiť znova a pokračuješ, kde si skončil. Po príchode nových jednotiek klikni <b>↻ Aktualizovať jednotky</b>.</li>
       </ol>
-      <p class="dk-mut">Tip: v sekcii „Vlastné dediny a ich klasifikácia“ (úplne dole) vidíš voľné jednotky každej dediny, či je OFF/DEFF a môžeš ju ručne prepnúť alebo vylúčiť. V „Pokročilé“ nastavíš rezervu jednotiek, ktoré majú zostať doma.</p>
+      <p class="dk-mut">Zoznam všetkých útokov (fronta, odoslané, odstránené) je schovaný pod <b>📋 Zoznam útokov</b> – rozklikni ho, keď ho potrebuješ. Tip: v sekcii „Vlastné dediny a ich klasifikácia“ (úplne dole) vidíš voľné jednotky každej dediny, či je OFF/DEFF a môžeš ju ručne prepnúť alebo vylúčiť. V „Pokročilé“ nastavíš rezervu jednotiek, ktoré majú zostať doma.</p>
     </div>
   </details>
   <div class="dk-grid">
@@ -1449,11 +1480,12 @@
     <span class="dk-mut" id="dk4-snap"></span>
   </div>
   <div id="dk4-sendbox" style="display:none;margin-top:12px">
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
-      <div id="dk4-sendinfo" style="flex:1;color:#fff;background:#3d2f1a;padding:8px 12px;border-radius:6px;font-size:12px">Nádvorie</div>
-      <button class="dk-btn x" id="dk4-closeframe">Zavrieť nádvorie</button>
+    <div style="display:flex;gap:8px;align-items:stretch;margin-bottom:6px;flex-wrap:wrap">
+      <div id="dk4-sendinfo" style="flex:1;min-width:240px;color:#fff;background:#3d2f1a;padding:8px 12px;border-radius:6px;font-size:12px">Nádvorie</div>
+      <button class="dk-btn big pri" id="dk4-next" style="min-width:190px">ĎALŠÍ ÚTOK ▶</button>
+      <button class="dk-btn x" id="dk4-closeframe">Zavrieť</button>
     </div>
-    <div class="dk-mut" style="margin-bottom:4px">Útok odošleš v nádvorí nižšie: <b>Útok → Poslať útok</b>. Script len predvyplní a skontroluje – ak je pruh červený, neodosielaj.</div>
+    <div class="dk-mut" style="margin-bottom:4px">V nádvorí klikni <b>Útok → Poslať útok</b>, potom <b>ĎALŠÍ ÚTOK ▶</b>. Ak je pruh červený, útok neodosielaj.</div>
     <div class="dk4-framehost"></div>
   </div>
   <div id="dk4-dyn"></div>
@@ -1478,7 +1510,7 @@
         const s = S();
         const c = counts();
         const pct = c.total ? Math.round((c.sent / c.total) * 100) : 0;
-        const busy = batch.running || !!monitor;
+        const busy = session.running;
         const arr = buildArrival();
         const tb = (k, l) => `<div class="dk-tab ${view === k ? 'on' : ''}" data-view="${k}">${l}</div>`;
         const n = (st) => state.queue.filter((q) => (Array.isArray(st) ? st.includes(q.status) : q.status === st)).length;
@@ -1506,18 +1538,20 @@
     <span class="dk-stat">Čakajúce <b>${c.waiting}</b> (pripravené ${c.ready})</span>
     <span class="dk-stat dk-err">Chybné <b>${c.errors}</b></span>
     <span class="dk-stat">Zostáva <b>${c.rest}</b></span>
-    ${batch.running
-        ? `<button class="dk-btn big stop" id="dk4-stop">■ ZASTAVIŤ</button>`
-        : `<button class="dk-btn big pri" id="dk4-batch" ${monitor || !c.ready ? 'disabled' : ''}>ODOSLAŤ PRIPRAVENÉ (${c.ready})</button>`}
+    ${session.running
+        ? `<span class="dk-stat"><b>Odosielanie prebieha</b> – pokračuj v nádvorí nižšie</span>`
+        : `<button class="dk-btn big pri" id="dk4-batch" ${!c.ready ? 'disabled' : ''}>ZAČAŤ ODOSIELANIE (${c.ready})</button>`}
   </div>
 
-  <div class="dk-tabs">
+  <details id="dk4-list" ${listOpen ? 'open' : ''}><summary>📋 Zoznam útokov – vo fronte ${n(['pending', 'ready', 'progress', 'unverified', 'error'])}, odoslané ${n('sent')} (klikni pre zobrazenie)</summary>
+  ${listOpen ? `<div class="dk-tabs">
     ${tb('queue', `Fronta (${n(['pending', 'ready', 'progress', 'unverified', 'error'])})`)}
     ${tb('sent', `Odoslané (${n('sent')})`)}
     ${tb('removed', `Odstránené (${n('removed')})`)}
     ${tb('all', `Všetko (${state.queue.length})`)}
   </div>
-  <div class="dk-tw">${renderTable()}</div>
+  <div class="dk-tw">${renderTable()}</div>` : ''}
+  </details>
 
   <details id="dk4-vill" ${villagesOpen ? 'open' : ''}><summary>Vlastné dediny a ich klasifikácia (${villages.length})</summary>${villagesOpen ? renderVillages() : ''}</details>`;
         box.find('#dk4-dyn').html(html);
@@ -1527,7 +1561,7 @@
         const t = now();
         const rows = sortedQueue().filter((q) => (view === 'queue' ? ACTIVE.has(q.status) : view === 'all' ? true : q.status === view));
         if (!rows.length) return `<div style="padding:16px" class="dk-mut">Žiadne útoky v tomto zozname.</div>`;
-        const busy = batch.running || !!monitor;
+        const busy = session.running;
         return `<table class="dk-t"><thead><tr>
 <th>#</th><th>Cieľ</th><th>Vysielajúca dedina</th><th>Typ</th><th>Zostava</th><th>Čas odoslania</th><th>Čas dopadu</th><th>Stav</th><th>Akcie</th>
 </tr></thead><tbody>${rows.map((q) => {
@@ -1554,7 +1588,7 @@
             const canSend = ['ready'].includes(q.status) && !busy;
             let actions = '';
             if (q.status === 'ready' || q.status === 'pending') {
-                actions += `<button class="dk-btn sm send" data-act="send" data-id="${q.id}" ${canSend ? '' : 'disabled'}>MANUÁLNE ODOSLAŤ</button> `;
+                actions += `<button class="dk-btn sm send" data-act="send" data-id="${q.id}" ${q.status === 'ready' ? '' : 'disabled'}>OTVORIŤ</button> `;
             }
             if (q.status === 'unverified') {
                 actions += `<button class="dk-btn sm" data-act="verify" data-id="${q.id}" ${busy ? 'disabled' : ''}>Overiť znova</button> <button class="dk-btn sm" data-act="marksent" data-id="${q.id}" ${busy ? 'disabled' : ''}>Bol odoslaný</button> <button class="dk-btn sm" data-act="back" data-id="${q.id}" ${busy ? 'disabled' : ''}>Nebol odoslaný</button> `;
@@ -1655,6 +1689,11 @@ ${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ
             S().coords = box.find('#dk4-coords').val();
             save();
         });
+        box.on('click', '#dk4-list > summary', (e) => {
+            e.preventDefault();
+            listOpen = !listOpen;
+            render();
+        });
         box.on('click', '#dk4-vill > summary', (e) => {
             e.preventDefault();
             villagesOpen = !box.find('#dk4-vill').prop('open');
@@ -1666,7 +1705,7 @@ ${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ
             render();
         });
         box.on('click', '#dk4-close', () => {
-            if (monitor || batch.running) return alert('Najprv dokonči alebo zastav odosielanie.');
+            if (session.running) return alert('Najprv zavri nádvorie (odosielanie).');
             clearInterval(ticker);
             box.remove();
         });
@@ -1733,13 +1772,9 @@ ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.le
             save();
             render();
         });
-        box.on('click', '#dk4-batch', startBatch);
-        box.on('click', '#dk4-closeframe', closeFrame);
-        box.on('click', '#dk4-stop', () => {
-            batch.stop = true;
-            if (!monitor) endBatch('Dávka zastavená.');
-            else if (window.UI && UI.InfoMessage) UI.InfoMessage('Dávka sa zastaví po aktuálnom útoku.');
-        });
+        box.on('click', '#dk4-batch', startSession);
+        box.on('click', '#dk4-next', () => nextAttack(true));
+        box.on('click', '#dk4-closeframe', () => endSession('Odosielanie ukončené.'));
         box.on('click', '[data-act]', async function () {
             const id = $(this).data('id');
             const item = state.queue.find((q) => q.id === id);
@@ -1750,7 +1785,14 @@ ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.le
                 return render();
             }
             if (act === 'send') {
-                return openSend(item, false);
+                if (!session.running) session = { running: true, current: null, skipped: new Set() };
+                if (!settleCurrent(true)) return;
+                const err = openSend(item);
+                if (err) {
+                    alert(`Útok #${item.no} sa teraz nedá otvoriť:\n${err}`);
+                    if (!session.current || session.current.status !== 'progress') endSession();
+                }
+                return;
             }
             if (act === 'cancel') {
                 if (!['pending', 'ready', 'error'].includes(item.status)) return;
