@@ -1,6 +1,6 @@
 /*
  * DK4 – Správca FAKE útokov (Divoké kmene, SK105)
- * Verzia: 1.0.0 (2026-11-18)
+ * Verzia: 1.1.0 (2026-11-18) – len ostrý režim, drž Enter
  *
  * Náhrada za "Mass Command Timer" (RedAlert, v3.2.2).
  * Z pôvodného scriptu sú prevzaté funkčné časti:
@@ -28,7 +28,7 @@
     /* ------------------------------------------------------------------ */
     /*  Konštanty                                                          */
     /* ------------------------------------------------------------------ */
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const WORLD = game_data.world;
     const PID = String(game_data.player.id);
     const KEY = `dk4fm_${WORLD}_${PID}`;
@@ -200,7 +200,7 @@
         reserve: {},
         override: {}, // villageId -> auto | off | deff | skip
     });
-    let state = { mode: 'test', settings: DEFAULT_SETTINGS(), queue: [], seq: 0 };
+    let state = { mode: 'live', settings: DEFAULT_SETTINGS(), queue: [], seq: 0 };
     try {
         const saved = JSON.parse(localStorage.getItem(KEY) || 'null');
         if (saved && Array.isArray(saved.queue)) {
@@ -210,7 +210,12 @@
         console.warn('DK4: uložený stav sa nepodarilo načítať', e);
     }
     // Útoky, ktoré boli pri obnovení stránky "v procese", sa musia overiť.
+    state.mode = 'live';
     state.queue.forEach((q) => {
+        if (q.test && ACTIVE.has(q.status) && q.status !== 'progress') {
+            q.status = 'removed';
+            q.reason = 'Testovací režim bol zrušený';
+        }
         if (q.status === 'progress') {
             q.status = 'unverified';
             q.reason = 'Stránka bola obnovená počas odosielania – over v prehľade príkazov.';
@@ -279,7 +284,13 @@
     };
     const pop = (u) => cfg.units[u].pop;
     const speed = (u) => cfg.units[u].speed;
-    const minPopFor = (points) => Math.max(1, Math.ceil((points * fakeLimit()) / 100));
+    // Body z mapy sveta môžu byť až 1 h staré → bezpečnostná rezerva +1 % (aspoň +1 obyv.).
+    const MAP_SAFETY_PCT = 1;
+    const fromMap = (v) => /mapa/.test(v.pointsSrc || '');
+    const minPopFor = (v) => {
+        const base = Math.max(1, Math.ceil((v.points * fakeLimit()) / 100));
+        return fromMap(v) ? base + Math.max(1, Math.ceil((base * MAP_SAFETY_PCT) / 100)) : base;
+    };
 
     /* ------------------------------------------------------------------ */
     /*  Načítanie vlastných dedín (body + jednotky doma)                   */
@@ -566,8 +577,8 @@
     }
 
     function composeFake(v, kind, avail) {
-        const minPop = minPopFor(v.points);
-        const ex = [`Body dediny ${fmtNum(v.points)}${v.pointsSrc ? ` (zdroj: ${v.pointsSrc})` : ''} × ${fakeLimit()} % = ${((v.points * fakeLimit()) / 100).toFixed(2)} → minimum ${minPop} obyv.`];
+        const minPop = minPopFor(v);
+        const ex = [`Body dediny ${fmtNum(v.points)}${v.pointsSrc ? ` (zdroj: ${v.pointsSrc})` : ''} × ${fakeLimit()} % = ${((v.points * fakeLimit()) / 100).toFixed(2)} → minimum ${minPop} obyv.${fromMap(v) ? ` (vrátane rezervy +${MAP_SAFETY_PCT} %, lebo body sú z mapy)` : ""}`];
         if (!v.points) return { ok: false, reason: 'neznáme body dediny', ex };
         let units = null;
         if (kind === 'OFF') {
@@ -604,7 +615,7 @@
         if (item.kind === 'OFF' && !(u.ram > 0)) errs.push('OFF fake bez baranidla');
         if (item.kind === 'DEFF' && unitList(u).some((k) => !DEFF_FILLERS.includes(k))) errs.push('DEFF fake smie obsahovať len kopijníkov a mečiarov');
         if (v) {
-            const minPop = minPopFor(v.points);
+            const minPop = minPopFor(v);
             if (popOf(u) < minPop) errs.push(`populácia ${popOf(u)} < minimum ${minPop}`);
             if (avail) unitList(u).forEach((k) => { if ((avail[k] || 0) < u[k]) errs.push(`nedostatok: ${UNIT_NAME[k]} ${avail[k] || 0}/${u[k]}`); });
         }
@@ -682,12 +693,8 @@
 
         targets.forEach((t) => {
             for (let k = 0; k < per; k++) {
-                if (state.mode === 'live' && (t.info.kind === 'own' || t.info.kind === 'missing')) {
-                    failed.push({ t, why: t.info.kind === 'own' ? 'vlastná dedina – v ostrom režime nie je povolená' : 'na súradniciach nie je dedina' });
-                    break;
-                }
-                if (state.mode === 'test' && t.info.kind === 'missing') {
-                    failed.push({ t, why: 'na súradniciach nie je dedina' });
+                if ((t.info.kind === 'own' || t.info.kind === 'missing')) {
+                    failed.push({ t, why: t.info.kind === 'own' ? 'vlastná dedina' : 'na súradniciach nie je dedina' });
                     break;
                 }
                 const rej = {};
@@ -723,7 +730,6 @@
                 const item = {
                     id: `${WORLD}-${++state.seq}-${uid()}`,
                     no: state.seq,
-                    test: state.mode === 'test',
                     target: t.coord,
                     targetInfo: t.info,
                     sourceId: v.id,
@@ -1140,7 +1146,7 @@
         }
         const col = level === 'ok' ? '#2e7d32' : level === 'warn' ? '#b26a00' : '#c62828';
         b.setAttribute('style', `background:${col};color:#fff;padding:10px 14px;margin:6px 0 10px;border-radius:6px;font:13px/1.5 Verdana,sans-serif`);
-        const inner = `<b>DK4 ${item.test ? '[TEST] ' : ''}útok #${item.no}</b> · ${esc(item.kind)} FAKE · ${esc(item.sourceName)} → <b>${esc(item.target)}</b> · ${esc(unitsText(item.units))} (${item.pop}/${item.minPop} obyv.)<br>${html}`;
+        const inner = `<b>DK4 útok #${item.no}</b> · ${esc(item.kind)} FAKE · ${esc(item.sourceName)} → <b>${esc(item.target)}</b> · ${esc(unitsText(item.units))} (${item.pop}/${item.minPop} obyv.)<br>${html}`;
         if (b.innerHTML !== inner) b.innerHTML = inner;
         sendInfo(inner, level);
     }
@@ -1254,13 +1260,6 @@
         if (batch.running || monitor) return;
         const c = counts();
         if (!c.ready) return alert('Žiadny útok nie je práve pripravený (sú mimo okna odoslania alebo v chybe).');
-        if (state.mode === 'test') {
-            if (!confirm(`TESTOVACÍ REŽIM: simulovať odoslanie ${c.ready} pripravených útokov? (Do hry sa nič nepošle.)`)) return;
-            batch = { running: true, stop: false };
-            render();
-            simulateBatch();
-            return;
-        }
         if (!confirm(`Spustiť odosielanie ${c.ready} pripravených útokov?\n\nNádvorie sa otvorí v paneli. DRŽ ENTER – každé stlačenie urobí jeden krok v hre (Útok → Poslať útok), po overení sa načíta ďalší cieľ.\nZastaviť môžeš tlačidlom ZASTAVIŤ alebo pustením Enteru.`)) return;
         batch = { running: true, stop: false };
         render();
@@ -1279,28 +1278,6 @@
         if (!item) return endBatch('Hotovo – žiadny ďalší pripravený útok.');
         const ok = await openSend(item, true);
         if (ok === false) setTimeout(nextInBatch, 300);
-    }
-    async function simulateBatch() {
-        while (batch.running && !batch.stop) {
-            const item = nextReady();
-            if (!item) break;
-            simulateSend(item, true);
-            render();
-            await sleep(250);
-        }
-        endBatch(batch.stop ? 'Simulácia zastavená.' : 'Simulácia dokončená.');
-    }
-    function simulateSend(item, quiet) {
-        const err = precheck(item);
-        if (err) {
-            if (!quiet) alert(`Útok #${item.no}: ${err}`);
-            return;
-        }
-        item.status = 'sent';
-        item.sentAt = now();
-        item.simulated = true;
-        log(item, 'SIMULOVANÉ odoslanie (testovací režim) – do hry nebolo nič poslané');
-        save();
     }
     function endBatch(msg) {
         batch = { running: false, stop: false };
@@ -1333,9 +1310,6 @@
 #dk4fm .dk-top{display:flex;align-items:center;gap:10px;padding:10px 14px;background:#3d2f1a;color:#f5e6c4}
 #dk4fm .dk-top h3{margin:0;font-size:15px;color:#fff;flex:1}
 #dk4fm .dk-mode{padding:4px 10px;border-radius:12px;font-weight:bold;cursor:pointer;border:0}
-#dk4fm.test .dk-top{background:#b45309}
-#dk4fm.test .dk-testbar{display:block}
-#dk4fm .dk-testbar{display:none;background:#fde68a;color:#7c2d12;padding:6px 14px;font-weight:bold;border-bottom:1px solid #d97706}
 #dk4fm .dk-body{padding:12px 14px}
 #dk4fm .dk-grid{display:grid;grid-template-columns:minmax(220px,1.4fr) minmax(260px,1fr) minmax(260px,1fr);gap:12px}
 @media (max-width:900px){#dk4fm .dk-grid{grid-template-columns:1fr}}
@@ -1381,15 +1355,12 @@
     // Statická časť (formulár) sa kreslí len raz / pri zmene režimu – aby sa neprepisovalo rozpísané pole.
     function renderStatic() {
         const s = S();
-        const test = state.mode === 'test';
         const html = `
 <div class="dk-top">
   <h3>⚔ DK4 – Správca FAKE útokov <span style="font-weight:normal;font-size:11px">v${VERSION} · ${esc(WORLD)}</span></h3>
   <span class="dk-mut" style="color:#f5e6c4">Čas sveta: <b id="dk4-clock">${fmt(now())}</b> (${tzLabel()})</span>
-  <button class="dk-mode" id="dk4-mode" style="background:${test ? '#fde68a' : '#c62828'};color:${test ? '#7c2d12' : '#fff'}">${test ? 'TESTOVACÍ REŽIM' : 'OSTRÝ REŽIM'}</button>
   <button class="dk-btn sm" id="dk4-close" title="Zavrieť panel (fronta zostane uložená)">✕</button>
 </div>
-<div class="dk-testbar">TESTOVACÍ REŽIM – hromadné odoslanie iba simuluje, do hry sa nič nepošle. Skutočne odoslať (MANUÁLNE ODOSLAŤ + Enter) sa dá len útok na barbarskú dedinu.</div>
 <div class="dk-body">
   <div class="dk-grid">
     <div class="dk-card">
@@ -1468,7 +1439,6 @@
             $('#content_value').prepend(box);
             bind(box);
         }
-        box.toggleClass('test', test);
         box.html(html);
     }
 
@@ -1481,7 +1451,6 @@
         const s = S();
         const c = counts();
         const pct = c.total ? Math.round((c.sent / c.total) * 100) : 0;
-        const test = state.mode === 'test';
         const busy = batch.running || !!monitor;
         const arr = buildArrival();
         const tb = (k, l) => `<div class="dk-tab ${view === k ? 'on' : ''}" data-view="${k}">${l}</div>`;
@@ -1506,7 +1475,7 @@
     <span class="dk-stat">Zostáva <b>${c.rest}</b></span>
     ${batch.running
         ? `<button class="dk-btn big stop" id="dk4-stop">■ ZASTAVIŤ</button>`
-        : `<button class="dk-btn big pri" id="dk4-batch" ${monitor || !c.ready ? 'disabled' : ''}>${test ? 'SIMULOVAŤ PRIPRAVENÉ' : 'ODOSLAŤ PRIPRAVENÉ'} (${c.ready})</button>`}
+        : `<button class="dk-btn big pri" id="dk4-batch" ${monitor || !c.ready ? 'disabled' : ''}>ODOSLAŤ PRIPRAVENÉ (${c.ready})</button>`}
   </div>
 
   <div class="dk-tabs">
@@ -1534,7 +1503,7 @@
             let sendCell = '';
             let landCell = '';
             if (q.status === 'sent') {
-                sendCell = `${fmt(q.sentAt)}${q.simulated ? ' <span class="dk-mut">(simulácia)</span>' : ''}`;
+                sendCell = `${fmt(q.sentAt)}`;
                 landCell = fmt(q.sentAt + q.travel);
             } else if (q.status === 'removed') {
                 sendCell = '–';
@@ -1550,11 +1519,9 @@
             const tk = q.targetInfo && q.targetInfo.kind;
             const tkTxt = { barb: 'barbarská', player: 'hráč', own: 'vlastná', unknown: 'neoverené', missing: 'neexistuje' }[tk] || '';
             const canSend = ['ready'].includes(q.status) && !busy;
-            const realAllowed = !q.test || tk === 'barb';
             let actions = '';
             if (q.status === 'ready' || q.status === 'pending') {
-                if (realAllowed && !(state.mode === 'test' && !q.test)) actions += `<button class="dk-btn sm send" data-act="send" data-id="${q.id}" ${canSend ? '' : 'disabled'}>MANUÁLNE ODOSLAŤ</button> `;
-                if (q.test) actions += `<button class="dk-btn sm" data-act="sim" data-id="${q.id}" ${canSend ? '' : 'disabled'}>Simulovať</button> `;
+                actions += `<button class="dk-btn sm send" data-act="send" data-id="${q.id}" ${canSend ? '' : 'disabled'}>MANUÁLNE ODOSLAŤ</button> `;
             }
             if (q.status === 'unverified') {
                 actions += `<button class="dk-btn sm" data-act="verify" data-id="${q.id}" ${busy ? 'disabled' : ''}>Overiť znova</button> <button class="dk-btn sm" data-act="marksent" data-id="${q.id}" ${busy ? 'disabled' : ''}>Bol odoslaný</button> <button class="dk-btn sm" data-act="back" data-id="${q.id}" ${busy ? 'disabled' : ''}>Nebol odoslaný</button> `;
@@ -1566,7 +1533,7 @@
                 ? `<tr class="st-${q.status}"><td></td><td colspan="8"><div class="dk-why"><b>Prečo tento plán:</b><ul>${q.why.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>${q.log && q.log.length ? `<b>História:</b><ul>${q.log.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<span class="dk-mut">ID: ${esc(q.id)}${q.commandId ? ' · príkaz #' + esc(q.commandId) : ''}</span></div></td></tr>`
                 : '';
             return `<tr class="st-${q.status}" data-row="${q.id}">
-<td>${q.no}${q.test ? '<br><span class="dk-mut">TEST</span>' : ''}</td>
+<td>${q.no}</td>
 <td><b>${esc(q.target)}</b><br><span class="dk-mut">${esc(tkTxt)}</span></td>
 <td><a href="/game.php?${SITTER}village=${q.sourceId}&screen=overview" target="_blank">${esc(q.sourceName)}</a><br><span class="dk-mut">${fmtNum(q.sourcePoints)} b.</span></td>
 <td><span class="dk-k ${q.kind}">${q.kind} FAKE</span></td>
@@ -1591,7 +1558,7 @@
                 const comp = composeFake(v, c.type, av);
                 use = comp.ok ? `<span class="dk-ok">použiteľná – ${esc(unitsText(comp.units))}</span>` : `<span class="dk-err">nepoužiteľná – ${esc(comp.reason)}</span>`;
             } else use = `<span class="dk-err">nepoužiteľná – ${esc(c.why)}</span>`;
-            return `<tr><td>${esc(v.name)}</td><td>${fmtNum(v.points)}</td><td>${v.points ? minPopFor(v.points) : '–'}</td>
+            return `<tr><td>${esc(v.name)}</td><td>${fmtNum(v.points)}</td><td>${v.points ? minPopFor(v) : '–'}</td>
 ${SHOWN_UNITS.map((u) => `<td title="doma ${v.troops[u] || 0}">${av[u] || 0}</td>`).join('')}
 <td>${c.type === 'OFF' || c.type === 'DEFF' ? `<span class="dk-k ${c.type}">${c.type}</span>` : c.type === 'SKIP' ? 'vylúčená' : '–'}<br><span class="dk-mut">${esc(c.why)}</span></td>
 <td><select class="dk4-ov" data-id="${v.id}">${['auto', 'off', 'deff', 'skip'].map((o) => `<option value="${o}" ${(ov[v.id] || 'auto') === o ? 'selected' : ''}>${{ auto: 'Auto', off: 'OFF', deff: 'DEFF', skip: 'Vylúčiť' }[o]}</option>`).join('')}</select></td>
@@ -1632,7 +1599,7 @@ ${SHOWN_UNITS.map((u) => `<td title="doma ${v.troops[u] || 0}">${av[u] || 0}</td
  · barbarské ${st.barb} · hráčske ${st.player} · vlastné ${st.own} · neexistujú ${st.missing}${st.unknown ? ` · neoverené ${st.unknown}` : ''}
 ${v.invalid.length ? `<br><span class="dk-err">Neplatné: ${esc(v.invalid.slice(0, 30).join(', '))}${v.invalid.length > 30 ? '…' : ''}</span>` : ''}
 ${v.mapErr ? `<br><span class="dk-err">Mapu sveta sa nepodarilo načítať (${esc(v.mapErr)}) – existencia cieľov nie je overená.</span>` : ''}
-${st.own && state.mode === 'live' ? '<br><span class="dk-err">Vlastné dediny nie sú v ostrom režime povolené ako cieľ.</span>' : ''}`;
+${st.own ? '<br><span class="dk-err">Vlastné dediny nie sú povolené ako cieľ.</span>' : ''}`;
     }
 
     function bind(box) {
@@ -1667,26 +1634,6 @@ ${st.own && state.mode === 'live' ? '<br><span class="dk-err">Vlastné dediny ni
             if (monitor || batch.running) return alert('Najprv dokonči alebo zastav odosielanie.');
             clearInterval(ticker);
             box.remove();
-        });
-        box.on('click', '#dk4-mode', () => {
-            if (monitor || batch.running) return;
-            const active = state.queue.filter((q) => ACTIVE.has(q.status)).length;
-            const to = state.mode === 'test' ? 'live' : 'test';
-            const msg = to === 'live'
-                ? 'Prepnúť do OSTRÉHO režimu?\nÚtoky sa budú otvárať v nádvorí na skutočné odoslanie (potvrdzuješ ich sám).'
-                : 'Prepnúť do TESTOVACIEHO režimu?';
-            if (!confirm(msg + (active ? `\n\nNeodoslané útoky (${active}) vo fronte budú odstránené – plán sa musí vytvoriť znova v novom režime.` : ''))) return;
-            state.queue.forEach((q) => {
-                if (ACTIVE.has(q.status) && q.status !== 'progress') {
-                    q.status = 'removed';
-                    q.reason = 'Zmena režimu';
-                }
-            });
-            state.mode = to;
-            save();
-            lastReport = '';
-            renderStatic();
-            render();
         });
         box.on('click', '#dk4-validate', async () => {
             readSettings(box);
@@ -1767,12 +1714,7 @@ ${res.failed.length ? `<br><span class="dk-err">Nenaplánované: ${res.failed.le
                 return render();
             }
             if (act === 'send') {
-                if (state.mode === 'test' && item.targetInfo.kind !== 'barb') return;
                 return openSend(item, false);
-            }
-            if (act === 'sim') {
-                simulateSend(item);
-                return render();
             }
             if (act === 'cancel') {
                 if (!['pending', 'ready', 'error'].includes(item.status)) return;
